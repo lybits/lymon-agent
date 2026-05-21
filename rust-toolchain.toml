@@ -1,0 +1,6 @@
+# Pins the Rust toolchain used for local dev to track stable, matching CI.
+# Bump explicitly when we want to require a newer MSRV in Cargo.toml.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -52,7 +52,7 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install protoc -y
 
-      - uses: dtolnay/rust-toolchain@1.83.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
 
