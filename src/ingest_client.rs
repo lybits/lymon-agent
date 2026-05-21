@@ -30,12 +30,7 @@ pub struct IngestClient {
 }
 
 impl IngestClient {
-    pub fn new(
-        endpoint: String,
-        api_key: String,
-        agent_id: String,
-        datasource_id: String,
-    ) -> Self {
+    pub fn new(endpoint: String, api_key: String, agent_id: String, datasource_id: String) -> Self {
         Self {
             endpoint,
             api_key,
