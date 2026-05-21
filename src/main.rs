@@ -84,7 +84,8 @@ async fn main() -> Result<()> {
         })
     };
 
-    // Run the ingest client in the foreground until the channel closes.
+    // Run the ingest client in the foreground until the channel closes
+    // or the stream errors. `run` consumes both `self` and `rx`.
     let ingest = IngestClient::new(
         cfg.ingest_endpoint.clone(),
         cfg.api_key.clone(),
