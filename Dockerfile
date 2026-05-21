@@ -36,10 +36,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # =============================================================================
 # Runtime stage (distroless — no shell, minimal attack surface)
 # =============================================================================
-FROM gcr.io/distroless/cc-debian12:nonroot
+# We use the root variant (not :nonroot) so the agent can write to the
+# /var/lib/lymon-agent volume mounted by docker-compose. Production hardening
+# (drop to nonroot with proper volume ownership) is Fase 1.
+FROM gcr.io/distroless/cc-debian12:latest
 
 COPY --from=builder /lymon-agent-bin /usr/local/bin/lymon-agent
-
-USER nonroot
 
 ENTRYPOINT ["/usr/local/bin/lymon-agent"]

@@ -47,6 +47,9 @@ thiserror = "2"
 [build-dependencies]
 tonic-build = "0.12"
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 opt-level = "z"        # optimize for binary size (criterio 5: <15MB)
 lto = "fat"
