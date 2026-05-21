@@ -128,10 +128,19 @@ impl BufferStreamer {
         }
 
         // 4. Main loop: claim a batch from the buffer, send, wait for ACK, process.
+        info!("entering main send loop");
+        let mut batches_sent: u64 = 0;
         loop {
             match self.buffer.claim_batch(self.max_batch_size).await? {
                 Some(batch) => {
+                    let batch_id = batch.batch_id.clone();
+                    let n = batch.samples.len();
+                    info!(batch_id = %batch_id, sample_count = n, "claimed; sending");
                     self.send_and_ack(&out_tx, &mut inbound, batch).await?;
+                    batches_sent += 1;
+                    if batches_sent % 10 == 0 {
+                        info!(batches_sent, "progress");
+                    }
                 }
                 None => {
                     // Buffer empty — sleep briefly to avoid a busy loop.
