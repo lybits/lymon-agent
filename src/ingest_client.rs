@@ -46,6 +46,10 @@ impl IngestClient {
 
     /// Run the ingest stream once. Consumes `self` and `sample_rx`.
     /// Returns when the channel is exhausted or the stream errors.
+    //
+    // result_large_err is a clippy 1.95+ lint about the size of tonic::Status
+    // in the interceptor closure return type. We can't change tonic's API.
+    #[allow(clippy::result_large_err)]
     pub async fn run(self, sample_rx: mpsc::Receiver<Vec<Sample>>) -> Result<()> {
         // Transform Vec<Sample> → SampleBatch inline (no spawn — keeps the
         // stream `'static + Send` as tonic requires while not aliasing rx).

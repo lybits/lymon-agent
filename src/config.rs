@@ -14,7 +14,11 @@ pub struct Config {
     pub modbus_port: u16,
     pub poll_interval_ms: u64,
     pub register_count: u16,
+    // Día 3: location of the SQLite WAL buffer
+    #[allow(dead_code)]
     pub buffer_path: String,
+    // Día 4: OpenTelemetry OTLP HTTP exporter endpoint
+    #[allow(dead_code)]
     pub otlp_endpoint: Option<String>,
 }
 
