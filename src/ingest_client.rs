@@ -83,10 +83,17 @@ impl BufferStreamer {
     #[allow(clippy::result_large_err)]
     async fn run_one_attempt(&self) -> Result<()> {
         // 1. Connect.
+        //
+        // IMPORTANT: do NOT set .timeout() on the Endpoint. It applies to
+        // the entire RPC lifetime, which for a long-lived bidirectional
+        // stream means the stream gets cancelled after N seconds even when
+        // healthy. Only set connect_timeout (TCP/HTTP2 handshake).
         let endpoint = Endpoint::from_shared(self.endpoint.clone())
             .context("invalid ingest endpoint")?
             .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30));
+            .tcp_keepalive(Some(Duration::from_secs(30)))
+            .http2_keep_alive_interval(Duration::from_secs(30))
+            .keep_alive_timeout(Duration::from_secs(10));
         let channel = endpoint.connect().await.context("ingest connect failed")?;
 
         let api_key = self.api_key.clone();
