@@ -4,8 +4,8 @@
 // register reads into Sample protobuf messages.
 
 use anyhow::{Context, Result};
-use std::net::SocketAddr;
 use std::time::SystemTime;
+use tokio::net::lookup_host;
 use tokio_modbus::client::tcp;
 use tokio_modbus::prelude::*;
 use tracing::{debug, info, warn};
@@ -31,11 +31,16 @@ impl ModbusClient {
 
     async fn connect(&mut self) -> Result<()> {
         let addr_str = format!("{}:{}", self.host, self.port);
-        let addr: SocketAddr = addr_str
-            .parse()
-            .with_context(|| format!("invalid Modbus address: {addr_str}"))?;
 
-        info!(addr = %addr, "connecting to Modbus TCP");
+        // Resolve hostname (Docker DNS, mDNS, etc.) — SocketAddr only parses
+        // IP:port, not host:port.
+        let addr = lookup_host(&addr_str)
+            .await
+            .with_context(|| format!("DNS lookup failed for {addr_str}"))?
+            .next()
+            .with_context(|| format!("no addresses resolved for {addr_str}"))?;
+
+        info!(host = %addr_str, resolved = %addr, "connecting to Modbus TCP");
         let ctx = tcp::connect(addr)
             .await
             .with_context(|| format!("failed to connect to Modbus at {addr}"))?;
