@@ -1,0 +1,55 @@
+[package]
+name = "lymon-agent"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "Apache-2.0"
+description = "Lymon Edge Agent — industrial data collection and forwarding"
+repository = "https://github.com/lybits/lymon-agent"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+# Modbus TCP client
+tokio-modbus = "0.16"
+
+# Local buffer (SQLite WAL)
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# gRPC client
+tonic = "0.12"
+prost = "0.13"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Idempotency keys
+ulid = "1.1"
+
+# Logging and tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+opentelemetry = { version = "0.27", features = ["trace"] }
+opentelemetry-otlp = { version = "0.27", features = ["http-proto"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio"] }
+tracing-opentelemetry = "0.28"
+
+# Config + CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+[build-dependencies]
+tonic-build = "0.12"
+
+[profile.release]
+opt-level = "z"        # optimize for binary size (criterio 5: <15MB)
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
