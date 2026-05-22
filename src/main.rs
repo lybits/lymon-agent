@@ -1,11 +1,20 @@
 // Copyright 2026 Lybits
 // Licensed under the Apache License, Version 2.0
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
+use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::KeyValue;
+use opentelemetry_otlp::{SpanExporter, WithExportConfig};
+use opentelemetry_sdk::runtime;
+use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::Resource;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{error, info};
+use tracing_opentelemetry::OpenTelemetryLayer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 mod buffer;
@@ -38,10 +47,10 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    init_tracing();
-
     let cli = Cli::parse();
     let cfg = config::Config::load(cli.config.as_deref())?;
+
+    init_tracing(cfg.otlp_endpoint.as_deref())?;
 
     info!(
         version = env!("CARGO_PKG_VERSION"),
@@ -112,13 +121,48 @@ async fn main() -> Result<()> {
     result
 }
 
-fn init_tracing() {
+fn init_tracing(otlp_endpoint: Option<&str>) -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("lymon_agent=info,tokio_modbus=warn"));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let fmt_layer = tracing_subscriber::fmt::layer()
         .with_target(true)
-        .json()
-        .init();
+        .json();
+
+    let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
+
+    match otlp_endpoint {
+        Some(endpoint) => {
+            let exporter = SpanExporter::builder()
+                .with_http()
+                .with_endpoint(format!("{endpoint}/v1/traces"))
+                .with_timeout(Duration::from_secs(3))
+                .build()
+                .context("creating OTLP exporter")?;
+
+            let resource = Resource::builder()
+                .with_attribute(KeyValue::new("service.name", "lymon-agent"))
+                .with_attribute(KeyValue::new(
+                    "service.version",
+                    env!("CARGO_PKG_VERSION"),
+                ))
+                .build();
+
+            let provider = TracerProvider::builder()
+                .with_batch_exporter(exporter, runtime::Tokio)
+                .with_resource(resource)
+                .build();
+
+            let tracer = provider.tracer("lymon-agent");
+            opentelemetry::global::set_tracer_provider(provider);
+
+            registry.with(OpenTelemetryLayer::new(tracer)).init();
+            info!(endpoint, "OpenTelemetry tracing enabled");
+        }
+        None => {
+            registry.init();
+        }
+    }
+
+    Ok(())
 }

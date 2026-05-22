@@ -159,6 +159,10 @@ impl BufferStreamer {
         }
     }
 
+    #[tracing::instrument(skip(self, out_tx, inbound, claimed), fields(
+        batch_id = %claimed.batch_id,
+        sample_count = claimed.samples.len()
+    ))]
     async fn send_and_ack(
         &self,
         out_tx: &mpsc::Sender<SampleBatch>,

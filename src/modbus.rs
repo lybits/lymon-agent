@@ -50,6 +50,7 @@ impl ModbusClient {
 
     /// Read all configured holding registers and convert to Samples.
     /// On any error, drops the connection so the next poll reconnects.
+    #[tracing::instrument(skip(self), fields(register_count = self.register_count))]
     pub async fn poll(&mut self) -> Result<Vec<Sample>> {
         if self.ctx.is_none() {
             self.connect().await?;

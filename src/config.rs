@@ -17,8 +17,7 @@ pub struct Config {
     // Día 3: location of the SQLite WAL buffer
     #[allow(dead_code)]
     pub buffer_path: String,
-    // Día 4: OpenTelemetry OTLP HTTP exporter endpoint
-    #[allow(dead_code)]
+    // OpenTelemetry OTLP HTTP exporter endpoint (e.g. http://jaeger:4318)
     pub otlp_endpoint: Option<String>,
 }
 

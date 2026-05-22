@@ -97,6 +97,7 @@ impl BufferDb {
     }
 
     /// Append samples to the buffer.
+    #[tracing::instrument(skip(self, samples), fields(sample_count = samples.len()))]
     pub async fn enqueue(&self, samples: Vec<Sample>) -> Result<()> {
         if samples.is_empty() {
             return Ok(());
@@ -134,6 +135,7 @@ impl BufferDb {
 
     /// Atomically claim up to `max_size` unbatched samples and tag them with
     /// a new batch_id. Returns None if the buffer is empty.
+    #[tracing::instrument(skip(self))]
     pub async fn claim_batch(&self, max_size: usize) -> Result<Option<ClaimedBatch>> {
         let conn = self.conn.clone();
         tokio::task::spawn_blocking(move || -> Result<Option<ClaimedBatch>> {
