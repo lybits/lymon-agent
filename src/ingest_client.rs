@@ -13,6 +13,7 @@
 // resending an in-flight batch after agent restart does not duplicate.
 
 use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
@@ -55,33 +56,36 @@ impl BufferStreamer {
     }
 
     /// Main loop. Reconnects with exponential backoff on stream/transport
-    /// errors. Only returns Ok(()) if the program is being intentionally
-    /// shut down (currently: never).
+    /// errors. Backoff is reset by `run_one_attempt` whenever a batch is
+    /// successfully ACKed, so a long outage followed by a quick recovery
+    /// doesn't penalize subsequent reconnects.
     pub async fn run(self) -> Result<()> {
-        let mut backoff = Duration::from_secs(1);
-        let max_backoff = Duration::from_secs(60);
+        let backoff_secs = Arc::new(AtomicU64::new(1));
+        let max_backoff: u64 = 60;
 
         loop {
-            match self.run_one_attempt().await {
+            match self.run_one_attempt(backoff_secs.clone()).await {
                 Ok(()) => {
                     info!("ingest stream ended cleanly");
-                    backoff = Duration::from_secs(1);
+                    backoff_secs.store(1, Ordering::Relaxed);
                 }
                 Err(e) => {
+                    let current = backoff_secs.load(Ordering::Relaxed);
                     warn!(
                         error = %e,
-                        backoff_ms = backoff.as_millis(),
+                        backoff_secs = current,
                         "stream error, will retry"
                     );
-                    tokio::time::sleep(backoff).await;
-                    backoff = (backoff * 2).min(max_backoff);
+                    tokio::time::sleep(Duration::from_secs(current)).await;
+                    let next = (current * 2).min(max_backoff);
+                    backoff_secs.store(next, Ordering::Relaxed);
                 }
             }
         }
     }
 
     #[allow(clippy::result_large_err)]
-    async fn run_one_attempt(&self) -> Result<()> {
+    async fn run_one_attempt(&self, backoff_secs: Arc<AtomicU64>) -> Result<()> {
         // 1. Connect.
         //
         // IMPORTANT: do NOT set .timeout() on the Endpoint. It applies to
@@ -133,13 +137,13 @@ impl BufferStreamer {
         loop {
             match self.buffer.claim_batch(self.max_batch_size).await? {
                 Some(batch) => {
-                    let batch_id = batch.batch_id.clone();
-                    let n = batch.samples.len();
-                    info!(batch_id = %batch_id, sample_count = n, "claimed; sending");
                     self.send_and_ack(&out_tx, &mut inbound, batch).await?;
+                    // Reset backoff: we've had a successful round-trip, so
+                    // the next transport error should start from 1s again.
+                    backoff_secs.store(1, Ordering::Relaxed);
                     batches_sent += 1;
-                    if batches_sent % 10 == 0 {
-                        info!(batches_sent, "progress");
+                    if batches_sent % 100 == 0 {
+                        debug!(batches_sent, "progress");
                     }
                 }
                 None => {
