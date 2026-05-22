@@ -140,13 +140,10 @@ fn init_tracing(otlp_endpoint: Option<&str>) -> Result<()> {
                 .build()
                 .context("creating OTLP exporter")?;
 
-            let resource = Resource::builder()
-                .with_attribute(KeyValue::new("service.name", "lymon-agent"))
-                .with_attribute(KeyValue::new(
-                    "service.version",
-                    env!("CARGO_PKG_VERSION"),
-                ))
-                .build();
+            let resource = Resource::new(vec![
+                KeyValue::new("service.name", "lymon-agent"),
+                KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
+            ]);
 
             let provider = TracerProvider::builder()
                 .with_batch_exporter(exporter, runtime::Tokio)
