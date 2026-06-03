@@ -19,6 +19,7 @@ use tracing_subscriber::EnvFilter;
 
 mod buffer;
 mod config;
+mod enroll;
 mod ingest_client;
 mod modbus;
 
@@ -52,11 +53,17 @@ async fn main() -> Result<()> {
 
     init_tracing(cfg.otlp_endpoint.as_deref())?;
 
+    // Resolve credentials: stored → direct env → one-time enrollment.
+    let creds = enroll::resolve(&cfg).await.map_err(|e| {
+        error!(error = %e, "failed to resolve agent credentials");
+        e
+    })?;
+
     info!(
         version = env!("CARGO_PKG_VERSION"),
-        agent_id = %cfg.agent_id,
+        agent_id = %creds.agent_id,
         datasource_id = %cfg.datasource_id,
-        ingest_endpoint = %cfg.ingest_endpoint,
+        ingest_endpoint = %creds.ingest_endpoint,
         modbus = format!("{}:{}", cfg.modbus_host, cfg.modbus_port),
         poll_ms = cfg.poll_interval_ms,
         registers = cfg.register_count,
@@ -109,9 +116,9 @@ async fn main() -> Result<()> {
     // Run the streamer in the foreground. It reconnects with backoff forever.
     let streamer = BufferStreamer::new(
         buffer.clone(),
-        cfg.ingest_endpoint.clone(),
-        cfg.api_key.clone(),
-        cfg.agent_id.clone(),
+        creds.ingest_endpoint.clone(),
+        creds.token.clone(),
+        creds.agent_id.clone(),
         cfg.datasource_id.clone(),
     );
 

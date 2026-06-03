@@ -1,0 +1,84 @@
+name: Release
+
+# Builds the agent for Windows / Linux / macOS and attaches the binaries to a
+# GitHub Release, so operators can download a ready-to-run agent from the
+# portal's "Add agent" install links. Triggered by pushing a v* tag, or
+# manually (workflow_dispatch) to produce artifacts without cutting a release.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write   # create releases + upload assets
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin: lymon-agent.exe
+            asset: lymon-agent-windows-x86_64.exe
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            bin: lymon-agent
+            asset: lymon-agent-linux-x86_64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            bin: lymon-agent
+            asset: lymon-agent-macos-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: lymon-agent
+
+      - uses: actions/checkout@v4
+        with:
+          repository: lybits/lymon-protos
+          path: lymon-protos
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc -y
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        working-directory: ./lymon-agent
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage binary
+        shell: bash
+        working-directory: ./lymon-agent
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: lymon-agent/dist/${{ matrix.asset }}
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: lymon-agent/dist/${{ matrix.asset }}
