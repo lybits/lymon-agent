@@ -1,21 +1,46 @@
 # Lymon Agent installer (Windows). Downloads the agent, writes its config,
-# and registers a startup task. Driven by the portal one-liner:
+# and registers a startup task. Azure-Arc-style one-liner — params can be
+# passed directly (preferred) or via LYMON_* env vars:
 #
-#   $env:LYMON_ENROLL_CODE="<CODE>"; $env:LYMON_ENROLL_URL="https://host/api/agent/enroll"; `
-#     iwr https://get.lymon.io/agent.ps1 -UseBasicParsing | iex
+#   & ([scriptblock]::Create((irm https://get.lymon.io/agent.ps1))) `
+#       -EnrollCode "<CODE>" -EnrollUrl "https://host/api/agent/enroll" `
+#       -ModbusHost "10.0.0.10" -Datasource "planta-1"
 #
-# Optional env before running: LYMON_DATASOURCE_ID, LYMON_MODBUS_HOST,
-# LYMON_MODBUS_PORT, LYMON_AGENT_VERSION.
+# Installs per-user by default (no admin needed). Add -System from an elevated
+# PowerShell for an all-users install that starts at boot.
+param(
+  [string]$EnrollCode = $env:LYMON_ENROLL_CODE,
+  [string]$EnrollUrl  = $env:LYMON_ENROLL_URL,
+  [string]$Datasource = $env:LYMON_DATASOURCE_ID,
+  [string]$ModbusHost = $env:LYMON_MODBUS_HOST,
+  [string]$ModbusPort = $env:LYMON_MODBUS_PORT,
+  [string]$Version    = $env:LYMON_AGENT_VERSION,
+  [string]$Repo       = $env:LYMON_AGENT_REPO,
+  [switch]$System
+)
 $ErrorActionPreference = 'Stop'
 
-$repo    = if ($env:LYMON_AGENT_REPO) { $env:LYMON_AGENT_REPO } else { 'lybits/lymon-agent' }
-$version = if ($env:LYMON_AGENT_VERSION) { $env:LYMON_AGENT_VERSION } else { 'latest' }
-$code    = $env:LYMON_ENROLL_CODE
-$url     = $env:LYMON_ENROLL_URL
-if (-not $code -or -not $url) { throw 'Set $env:LYMON_ENROLL_CODE and $env:LYMON_ENROLL_URL first.' }
+$repo    = if ($Repo) { $Repo } else { 'lybits/lymon-agent' }
+$version = if ($Version) { $Version } else { 'latest' }
+$code    = $EnrollCode
+$url     = $EnrollUrl
+if (-not $code -or -not $url) { throw 'Provide -EnrollCode and -EnrollUrl (or set $env:LYMON_ENROLL_CODE / _URL).' }
 
-$dir = 'C:\Program Files\LymonAgent'
+# Install location. Per-user by default (always writable, no admin). -System
+# uses Program Files + a boot task and requires an elevated shell.
+if ($System) {
+  $dir = Join-Path $env:ProgramFiles 'LymonAgent'
+  $bufferDir = Join-Path $env:ProgramData 'LymonAgent'
+} else {
+  $base = $env:LOCALAPPDATA
+  if (-not $base) { $base = Join-Path $env:USERPROFILE 'AppData\Local' }
+  if (-not $base) { $base = $env:TEMP }
+  $dir = Join-Path $base 'LymonAgent'
+  $bufferDir = $dir
+}
+Write-Host "Install dir: $dir"
 New-Item -ItemType Directory -Force -Path $dir | Out-Null
+New-Item -ItemType Directory -Force -Path $bufferDir | Out-Null
 $exe = Join-Path $dir 'lymon-agent.exe'
 
 $asset = 'lymon-agent-windows-x86_64.exe'
@@ -24,28 +49,47 @@ $dl = if ($version -eq 'latest') {
 } else {
   "https://github.com/$repo/releases/download/$version/$asset"
 }
-Write-Host "Downloading lymon-agent ($asset) …"
+Write-Host "Downloading lymon-agent ($asset) ..."
 Invoke-WebRequest -Uri $dl -OutFile $exe -UseBasicParsing
 
-# Persist config as machine env vars (read by the agent + the startup task).
-[Environment]::SetEnvironmentVariable('LYMON_ENROLL_CODE', $code, 'Machine')
-[Environment]::SetEnvironmentVariable('LYMON_ENROLL_URL',  $url,  'Machine')
-[Environment]::SetEnvironmentVariable('LYMON_DATASOURCE_ID', ($env:LYMON_DATASOURCE_ID  ?? 'default-source'), 'Machine')
-[Environment]::SetEnvironmentVariable('LYMON_MODBUS_HOST',   ($env:LYMON_MODBUS_HOST     ?? 'CHANGE_ME'),     'Machine')
-[Environment]::SetEnvironmentVariable('LYMON_MODBUS_PORT',   ($env:LYMON_MODBUS_PORT     ?? '502'),          'Machine')
-[Environment]::SetEnvironmentVariable('LYMON_BUFFER_PATH',   (Join-Path $env:ProgramData 'LymonAgent\buffer.db'), 'Machine')
+# Default helper (Windows PowerShell 5.1 has no ?? operator).
+function Def($v, $d) { if ([string]::IsNullOrEmpty($v)) { $d } else { $v } }
+$datasource = Def $Datasource 'default-source'
+$modbusHost = Def $ModbusHost 'CHANGE_ME'
+$modbusPort = Def $ModbusPort '502'
+$bufferPath = Join-Path $bufferDir 'buffer.db'
 
-# Run at startup as SYSTEM (native Windows Service wrapper ships in agent v0.3;
-# a scheduled task keeps it running 24/7 without a service-aware binary).
-$action  = New-ScheduledTaskAction -Execute $exe
-$trigger = New-ScheduledTaskTrigger -AtStartup
-$principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+# Self-contained launcher the task runs: sets the config in-process then starts
+# the agent (more reliable than relying on persisted env reaching the task).
+$launcher = Join-Path $dir 'start-lymon-agent.cmd'
+@"
+@echo off
+set "LYMON_ENROLL_CODE=$code"
+set "LYMON_ENROLL_URL=$url"
+set "LYMON_DATASOURCE_ID=$datasource"
+set "LYMON_MODBUS_HOST=$modbusHost"
+set "LYMON_MODBUS_PORT=$modbusPort"
+set "LYMON_BUFFER_PATH=$bufferPath"
+"%~dp0lymon-agent.exe"
+"@ | Set-Content -Path $launcher -Encoding ASCII
+
+# Keep the agent running via a scheduled task (a native service wrapper ships
+# in agent v0.3). -System → SYSTEM at boot; default → current user at logon.
+$action   = New-ScheduledTaskAction -Execute $launcher
 $settings = New-ScheduledTaskSettingsSet -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1)
+if ($System) {
+  $trigger   = New-ScheduledTaskTrigger -AtStartup
+  $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+} else {
+  $trigger   = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+  $principal = New-ScheduledTaskPrincipal -UserId $env:USERNAME -LogonType Interactive
+}
 Register-ScheduledTask -TaskName 'LymonAgent' -Action $action -Trigger $trigger `
   -Principal $principal -Settings $settings -Force | Out-Null
-
 Start-ScheduledTask -TaskName 'LymonAgent'
-Write-Host '✓ lymon-agent installed and started (Task Scheduler: LymonAgent).'
-if (($env:LYMON_MODBUS_HOST ?? 'CHANGE_ME') -eq 'CHANGE_ME') {
-  Write-Host '  Set LYMON_MODBUS_HOST (machine env) to your PLC/source IP, then restart the task.'
+
+Write-Host "OK - lymon-agent installed in $dir and started (Scheduled Task: LymonAgent)."
+Write-Host "  Runs in the background; verify ingestion in the Lymon portal."
+if ($modbusHost -eq 'CHANGE_ME') {
+  Write-Host "  WARNING: no -ModbusHost given; set your PLC/source IP and re-run."
 }
