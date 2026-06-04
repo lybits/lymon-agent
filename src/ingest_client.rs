@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::MetadataValue;
-use tonic::transport::Endpoint;
+use tonic::transport::{ClientTlsConfig, Endpoint};
 use tonic::Request;
 use tracing::{debug, info, warn};
 
@@ -96,13 +96,20 @@ impl BufferStreamer {
         // HTTP/2 keepalive is tight (5s ping interval, 3s response timeout,
         // active even when idle) so we detect a dead upstream within ~8s
         // rather than after tens of seconds of silent buffering.
-        let endpoint = Endpoint::from_shared(self.endpoint.clone())
+        let mut endpoint = Endpoint::from_shared(self.endpoint.clone())
             .context("invalid ingest endpoint")?
             .connect_timeout(Duration::from_secs(5))
             .tcp_keepalive(Some(Duration::from_secs(10)))
             .http2_keep_alive_interval(Duration::from_secs(5))
             .keep_alive_timeout(Duration::from_secs(3))
             .keep_alive_while_idle(true);
+        // A cloud ingest is reached over https (TLS via a public CA); a local /
+        // edge ingest stays plaintext h2c. tonic needs explicit TLS for https.
+        if self.endpoint.starts_with("https") {
+            endpoint = endpoint
+                .tls_config(ClientTlsConfig::new().with_webpki_roots())
+                .context("configuring TLS for ingest")?;
+        }
         let channel = endpoint.connect().await.context("ingest connect failed")?;
 
         let api_key = self.api_key.clone();

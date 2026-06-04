@@ -18,8 +18,9 @@ tokio-modbus = "0.16"
 # Local buffer (SQLite WAL)
 rusqlite = { version = "0.32", features = ["bundled"] }
 
-# gRPC client
-tonic = "0.12"
+# gRPC client (tls-webpki-roots → can dial a cloud ingest over https with a
+# public CA, bundled roots so Windows/cross builds need no system trust store).
+tonic = { version = "0.12", features = ["tls", "tls-webpki-roots"] }
 prost = "0.13"
 
 # Serialization
