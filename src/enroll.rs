@@ -18,12 +18,19 @@ use tracing::info;
 
 use crate::config::Config;
 
-/// Concrete credentials the agent runs with.
+/// Concrete credentials the agent runs with. tenant_id + control_endpoint are
+/// optional for backward compat with credentials.json written before the
+/// control channel existed; when present the agent opens the gateway control
+/// channel (agent-as-gateway).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Credentials {
     pub agent_id: String,
     pub token: String,
     pub ingest_endpoint: String,
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    #[serde(default)]
+    pub control_endpoint: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -36,6 +43,25 @@ struct EnrollResponse {
     agent_id: String,
     token: String,
     ingest_endpoint: String,
+    #[serde(default)]
+    tenant_id: Option<String>,
+}
+
+/// Derive the control-channel WebSocket URL from the enrollment URL:
+///   https://host/api/agent/enroll → wss://host/agent-control
+///   http://host:3013/api/agent/enroll → ws://host:3013/agent-control
+fn derive_control_endpoint(enroll_url: &str) -> Option<String> {
+    let base = enroll_url
+        .strip_suffix("/api/agent/enroll")
+        .unwrap_or(enroll_url)
+        .trim_end_matches('/');
+    if let Some(rest) = base.strip_prefix("https://") {
+        Some(format!("wss://{rest}/agent-control"))
+    } else if let Some(rest) = base.strip_prefix("http://") {
+        Some(format!("ws://{rest}/agent-control"))
+    } else {
+        None
+    }
 }
 
 /// credentials.json lives next to the buffer db (a writable, persistent dir).
@@ -61,7 +87,15 @@ pub async fn resolve(cfg: &Config) -> Result<Credentials> {
         (cfg.agent_id.clone(), cfg.api_key.clone(), cfg.ingest_endpoint.clone())
     {
         info!(agent_id = %agent_id, "using credentials from environment");
-        return Ok(Credentials { agent_id, token, ingest_endpoint });
+        // Legacy/advanced path has no tenant/control endpoint → gateway control
+        // channel stays disabled (ingest still works).
+        return Ok(Credentials {
+            agent_id,
+            token,
+            ingest_endpoint,
+            tenant_id: None,
+            control_endpoint: None,
+        });
     }
 
     // 3) One-time enrollment exchange.
@@ -86,7 +120,13 @@ pub async fn resolve(cfg: &Config) -> Result<Credentials> {
         bail!("enrollment rejected: HTTP {status} {body}");
     }
     let er: EnrollResponse = resp.json().await.context("parsing enrollment response")?;
-    let creds = Credentials { agent_id: er.agent_id, token: er.token, ingest_endpoint: er.ingest_endpoint };
+    let creds = Credentials {
+        agent_id: er.agent_id,
+        token: er.token,
+        ingest_endpoint: er.ingest_endpoint,
+        tenant_id: er.tenant_id,
+        control_endpoint: derive_control_endpoint(&url),
+    };
 
     // Persist so the next start skips the exchange (the code is single-use).
     if let Some(dir) = path.parent() {

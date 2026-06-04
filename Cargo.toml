@@ -34,6 +34,14 @@ ulid = "1.1"
 # builds don't need a system OpenSSL).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# Control channel (agent-as-gateway): WebSocket client to the cloud gateway,
+# TLS via rustls + bundled webpki roots (matches reqwest/tonic — no system trust).
+tokio-tungstenite = { version = "0.23", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3"
+# rustls 0.23 needs a process-wide crypto provider installed before the first
+# wss handshake; we install `ring` in main(). Pinned to match tokio-tungstenite.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
 # Logging and tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

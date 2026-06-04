@@ -19,6 +19,7 @@ use tracing_subscriber::EnvFilter;
 
 mod buffer;
 mod config;
+mod control;
 mod enroll;
 mod ingest_client;
 mod modbus;
@@ -50,6 +51,12 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let cfg = config::Config::load(cli.config.as_deref())?;
+
+    // Install a process-wide rustls crypto provider (ring) before any TLS. The
+    // control channel's wss handshake (tokio-tungstenite) uses the process
+    // default; without this, rustls 0.23 panics on first connect. Idempotent —
+    // ignore the error if another component already installed one.
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     init_tracing(cfg.otlp_endpoint.as_deref())?;
 
@@ -113,6 +120,22 @@ async fn main() -> Result<()> {
         })
     };
 
+    // Agent-as-gateway control channel. Opens only when the agent enrolled
+    // with a tenant + control endpoint (modern enrollment); legacy/env creds
+    // skip it. Best-effort + self-reconnecting, so a failure here never stops
+    // ingestion. PR1: connects + heartbeats + stores provisioned datasources;
+    // query execution (local adapters) lands in PR2.
+    let control_handle = if creds.tenant_id.is_some() && creds.control_endpoint.is_some() {
+        let creds = creds.clone();
+        Some(tokio::spawn(async move {
+            // PR1 advertises no gateway adapter capabilities yet.
+            control::run(creds, Vec::new()).await;
+        }))
+    } else {
+        info!("control channel not configured (no tenant/control endpoint in credentials); gateway queries disabled");
+        None
+    };
+
     // Run the streamer in the foreground. It reconnects with backoff forever.
     let streamer = BufferStreamer::new(
         buffer.clone(),
@@ -125,6 +148,9 @@ async fn main() -> Result<()> {
     let result = streamer.run().await;
 
     modbus_handle.abort();
+    if let Some(h) = control_handle {
+        h.abort();
+    }
     result
 }
 
