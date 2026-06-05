@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -107,27 +107,103 @@ impl Collector {
     }
 }
 
-/// One ingest's poll loop: read → enqueue (origin = connector_id) → sleep.
+/// One ingest's poll loop. By default it reads once per `interval_s` and
+/// records each reading. When `transform.sample_interval_ms` is set and finer
+/// than the record interval, it oversamples at that cadence and records the
+/// mean over each record window (edge downsampling: sample fast, store coarse).
 async fn run_ingest(buffer: Arc<BufferDb>, conn: Conn, ing: Ingest) {
-    let interval = Duration::from_secs(ing.interval_s.max(1));
+    let record = Duration::from_secs(ing.interval_s.max(1));
     // A persistent Modbus connection per task (None for other adapters).
     let mut modbus: Option<ModbusClient> = None;
+    let sample_ms = ing
+        .transform
+        .get("sample_interval_ms")
+        .and_then(Value::as_u64)
+        .filter(|&m| m >= 1);
+    let oversample = sample_ms.is_some_and(|m| u128::from(m) < record.as_millis());
     info!(ingest = %ing.ingest_id, connector = %ing.connector_id, ty = %conn.ds_type,
-        interval_s = ing.interval_s, "collector ingest started");
+        interval_s = ing.interval_s, oversample, "collector ingest started");
     loop {
-        match collect_once(&conn, &ing, &mut modbus).await {
-            Ok(samples) if !samples.is_empty() => {
-                if let Err(e) = buffer
-                    .enqueue_with_origin(Some(ing.connector_id.clone()), samples)
-                    .await
-                {
-                    error!(ingest = %ing.ingest_id, error = %e, "collector enqueue failed");
+        if oversample {
+            run_window(
+                &buffer,
+                &conn,
+                &ing,
+                &mut modbus,
+                record,
+                Duration::from_millis(sample_ms.unwrap()),
+            )
+            .await;
+        } else {
+            match collect_once(&conn, &ing, &mut modbus).await {
+                Ok(samples) if !samples.is_empty() => {
+                    if let Err(e) = buffer
+                        .enqueue_with_origin(Some(ing.connector_id.clone()), samples)
+                        .await
+                    {
+                        error!(ingest = %ing.ingest_id, error = %e, "collector enqueue failed");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => warn!(ingest = %ing.ingest_id, error = %e, "collect cycle failed"),
+            }
+            tokio::time::sleep(record).await;
+        }
+    }
+}
+
+/// Oversample one record window: read every `sample_every` for `record`, then
+/// enqueue the mean per variable (timestamped at the window end).
+async fn run_window(
+    buffer: &Arc<BufferDb>,
+    conn: &Conn,
+    ing: &Ingest,
+    modbus: &mut Option<ModbusClient>,
+    record: Duration,
+    sample_every: Duration,
+) {
+    let start = Instant::now();
+    let mut acc: HashMap<String, (f64, u32)> = HashMap::new();
+    loop {
+        match collect_once(conn, ing, modbus).await {
+            Ok(samples) => {
+                for s in samples {
+                    let e = acc.entry(s.variable_id).or_insert((0.0, 0));
+                    e.0 += s.value;
+                    e.1 += 1;
                 }
             }
-            Ok(_) => {}
-            Err(e) => warn!(ingest = %ing.ingest_id, error = %e, "collect cycle failed"),
+            Err(e) => warn!(ingest = %ing.ingest_id, error = %e, "oversample read failed"),
         }
-        tokio::time::sleep(interval).await;
+        let elapsed = start.elapsed();
+        if elapsed >= record {
+            break;
+        }
+        tokio::time::sleep(sample_every.min(record - elapsed)).await;
+    }
+    if acc.is_empty() {
+        return;
+    }
+    let ts_ms = now_ms();
+    let out: Vec<Sample> = acc
+        .into_iter()
+        .map(|(variable_id, (sum, count))| Sample {
+            variable_id,
+            ts_ms,
+            value: if count > 0 {
+                sum / f64::from(count)
+            } else {
+                sum
+            },
+            quality: 0,
+            attrs: Default::default(),
+        })
+        .collect();
+    if let Err(e) = buffer
+        .enqueue_with_origin(Some(ing.connector_id.clone()), out)
+        .await
+    {
+        error!(ingest = %ing.ingest_id, error = %e, "collector enqueue failed");
     }
 }
 
