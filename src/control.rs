@@ -28,7 +28,12 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
+use crate::collector::{Collector, Conn, Ingest};
 use crate::enroll::Credentials;
+
+/// Shared connector store (connector_id → connector), owned by the collector
+/// and consulted here so a query_request can target an agent-host connector.
+type ConnStore = Arc<Mutex<HashMap<String, Conn>>>;
 
 /// A datasource the agent fronts: its adapter type + non-secret config +
 /// resolved secrets, as pushed by the cloud. Kept in memory only.
@@ -43,8 +48,10 @@ struct ProvisionedDs {
 type Store = Arc<Mutex<HashMap<String, ProvisionedDs>>>;
 
 /// Run the control channel forever: connect, serve, and reconnect with capped
-/// exponential backoff. Never returns under normal operation.
-pub async fn run(creds: Credentials, capabilities: Vec<String>) {
+/// exponential backoff. Never returns under normal operation. The `collector`
+/// (Phase 2) owns the provisioned connectors + ingests; provision frames drive
+/// its reconfigure, and its connector store backs query_request lookups.
+pub async fn run(creds: Credentials, capabilities: Vec<String>, collector: Arc<Collector>) {
     let (url, tenant_id) = match (creds.control_endpoint.clone(), creds.tenant_id.clone()) {
         (Some(u), Some(t)) => (u, t),
         _ => {
@@ -61,6 +68,7 @@ pub async fn run(creds: Credentials, capabilities: Vec<String>) {
             &tenant_id,
             &creds.token,
             &capabilities,
+            &collector,
         )
         .await
         {
@@ -78,6 +86,7 @@ async fn serve(
     tenant_id: &str,
     token: &str,
     capabilities: &[String],
+    collector: &Arc<Collector>,
 ) -> Result<()> {
     info!(url, "connecting agent control channel");
     let (ws, _resp) = connect_async(url).await.context("ws connect")?;
@@ -121,7 +130,7 @@ async fn serve(
 
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
 
-    let result = read_loop(&mut read, &tx, &store).await;
+    let result = read_loop(&mut read, &tx, &store, collector).await;
 
     heartbeat.abort();
     writer.abort();
@@ -132,10 +141,12 @@ async fn read_loop<S>(
     read: &mut S,
     tx: &mpsc::UnboundedSender<Message>,
     store: &Store,
+    collector: &Arc<Collector>,
 ) -> Result<()>
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
+    let connectors = collector.connectors();
     while let Some(frame) = read.next().await {
         let msg = frame.context("ws read")?;
         match msg {
@@ -158,37 +169,47 @@ where
                     }
                     Some("provision") => {
                         let partial = v.get("partial").and_then(Value::as_bool).unwrap_or(false);
-                        let list = v
-                            .get("datasources")
-                            .and_then(Value::as_array)
-                            .cloned()
-                            .unwrap_or_default();
-                        let mut s = store.lock().await;
-                        if !partial {
-                            s.clear();
-                        }
-                        for d in list {
-                            if let Some(id) = d.get("datasource_id").and_then(Value::as_str) {
-                                s.insert(
-                                    id.to_string(),
-                                    ProvisionedDs {
-                                        ds_type: d
-                                            .get("type")
-                                            .and_then(Value::as_str)
-                                            .unwrap_or("")
-                                            .to_string(),
-                                        config: d.get("config").cloned().unwrap_or(Value::Null),
-                                        secrets: d.get("secrets").cloned().unwrap_or(Value::Null),
-                                    },
-                                );
+                        // A frame touches a dimension only if its key is present
+                        // (collector pushes omit `datasources`, and vice-versa).
+                        if let Some(list) = v.get("datasources").and_then(Value::as_array) {
+                            let mut s = store.lock().await;
+                            if !partial {
+                                s.clear();
                             }
+                            for d in list {
+                                if let Some(id) = d.get("datasource_id").and_then(Value::as_str) {
+                                    s.insert(
+                                        id.to_string(),
+                                        ProvisionedDs {
+                                            ds_type: d
+                                                .get("type")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or("")
+                                                .to_string(),
+                                            config: d.get("config").cloned().unwrap_or(Value::Null),
+                                            secrets: d
+                                                .get("secrets")
+                                                .cloned()
+                                                .unwrap_or(Value::Null),
+                                        },
+                                    );
+                                }
+                            }
+                            info!(count = s.len(), partial, "provisioned datasources updated");
                         }
-                        info!(count = s.len(), partial, "provisioned datasources updated");
+                        // Phase-2 collector set: reconfigure when either key is
+                        // present (a connector-only / ingest-only push counts).
+                        if v.get("connectors").is_some() || v.get("ingests").is_some() {
+                            collector
+                                .reconfigure(parse_connectors(&v), parse_ingests(&v))
+                                .await;
+                        }
                     }
                     Some("query_request") => {
                         let tx = tx.clone();
                         let store = store.clone();
-                        tokio::spawn(async move { handle_query(v, store, tx).await });
+                        let connectors = connectors.clone();
+                        tokio::spawn(async move { handle_query(v, store, connectors, tx).await });
                     }
                     _ => {}
                 }
@@ -206,7 +227,12 @@ where
 /// Per-op row cap the agent enforces locally (matches the cloud default).
 const MAX_ROWS: usize = 100_000;
 
-async fn handle_query(req: Value, store: Store, tx: mpsc::UnboundedSender<Message>) {
+async fn handle_query(
+    req: Value,
+    store: Store,
+    connectors: ConnStore,
+    tx: mpsc::UnboundedSender<Message>,
+) {
     let request_id = req
         .get("request_id")
         .and_then(Value::as_str)
@@ -228,23 +254,33 @@ async fn handle_query(req: Value, store: Store, tx: mpsc::UnboundedSender<Messag
         .and_then(Value::as_u64)
         .unwrap_or(30_000);
 
-    // Clone the provisioned config out of the store so we don't hold the lock
-    // across the (awaiting) adapter call.
-    let ds = { store.lock().await.get(&ds_id).cloned() };
-    let Some(ds) = ds else {
+    // Resolve the origin: a legacy provisioned datasource OR a Phase-2 agent-host
+    // connector (same id space from the cloud's view). Clone the (type, config,
+    // secrets) out so we don't hold a lock across the awaiting adapter call.
+    let resolved: Option<(String, Value, Value)> = {
+        if let Some(d) = store.lock().await.get(&ds_id) {
+            Some((d.ds_type.clone(), d.config.clone(), d.secrets.clone()))
+        } else {
+            connectors
+                .lock()
+                .await
+                .get(&ds_id)
+                .map(|c| (c.ds_type.clone(), c.config.clone(), c.secrets.clone()))
+        }
+    };
+    let Some((ds_type, config, secrets)) = resolved else {
         respond_err(
             &tx,
             &request_id,
             "agent_unknown_datasource",
-            &format!("agent has no config for datasource {ds_id}"),
+            &format!("agent has no config for {ds_id}"),
         );
         return;
     };
 
-    // Dispatch to the local adapter for this datasource type. PR2 ships PSS;
-    // postgresql/http_rest/… follow.
-    let outcome = match ds.ds_type.as_str() {
-        "pss" => crate::pss::run(&op, &args, &ds.config, &ds.secrets, timeout_ms, MAX_ROWS).await,
+    // Dispatch to the local adapter for this origin's type.
+    let outcome = match ds_type.as_str() {
+        "pss" => crate::pss::run(&op, &args, &config, &secrets, timeout_ms, MAX_ROWS).await,
         other => Err(anyhow::anyhow!("agent has no adapter for {other}.{op} yet")),
     };
 
@@ -260,6 +296,54 @@ async fn handle_query(req: Value, store: Store, tx: mpsc::UnboundedSender<Messag
         }
         Err(e) => respond_err(&tx, &request_id, "agent_query_failed", &e.to_string()),
     }
+}
+
+/// Parse the `connectors` array of a provision frame into (id, Conn) pairs.
+fn parse_connectors(v: &Value) -> Vec<(String, Conn)> {
+    v.get("connectors")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let id = c.get("connector_id").and_then(Value::as_str)?.to_string();
+                    Some((
+                        id,
+                        Conn {
+                            ds_type: c
+                                .get("type")
+                                .and_then(Value::as_str)
+                                .unwrap_or("")
+                                .to_string(),
+                            config: c.get("config").cloned().unwrap_or(Value::Null),
+                            secrets: c.get("secrets").cloned().unwrap_or(Value::Null),
+                        },
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse the `ingests` array of a provision frame into Ingest jobs.
+fn parse_ingests(v: &Value) -> Vec<Ingest> {
+    v.get("ingests")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|i| {
+                    let ingest_id = i.get("ingest_id").and_then(Value::as_str)?.to_string();
+                    let connector_id = i.get("connector_id").and_then(Value::as_str)?.to_string();
+                    Some(Ingest {
+                        ingest_id,
+                        connector_id,
+                        selection: i.get("selection").cloned().unwrap_or(Value::Null),
+                        interval_s: i.get("interval_s").and_then(Value::as_u64).unwrap_or(60),
+                        naming: i.get("naming").cloned().unwrap_or(Value::Null),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn respond_err(tx: &mpsc::UnboundedSender<Message>, request_id: &str, code: &str, detail: &str) {

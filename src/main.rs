@@ -18,6 +18,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 mod buffer;
+mod collector;
 mod config;
 mod control;
 mod enroll;
@@ -120,11 +121,22 @@ async fn main() -> Result<()> {
     // skip it. Best-effort + self-reconnecting, so a failure here never stops
     // ingestion. PR1: connects + heartbeats + stores provisioned datasources;
     // query execution (local adapters) lands in PR2.
+    // Phase 2 collector: owns the buffer poll loops for provisioned ingests and
+    // backs the control channel's connector store. Provision frames drive it.
+    let collector = crate::collector::Collector::new(buffer.clone());
+
     let control_handle = if creds.tenant_id.is_some() && creds.control_endpoint.is_some() {
         let creds = creds.clone();
+        let collector = collector.clone();
         Some(tokio::spawn(async move {
-            // Advertise the gateway adapters this agent can run locally.
-            control::run(creds, vec!["pss".to_string()]).await;
+            // Advertise the adapters this agent can run locally (gateway queries
+            // + collection).
+            control::run(
+                creds,
+                vec!["pss".to_string(), "modbus".to_string()],
+                collector,
+            )
+            .await;
         }))
     } else {
         info!("control channel not configured (no tenant/control endpoint in credentials); gateway queries disabled");
