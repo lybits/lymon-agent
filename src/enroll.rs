@@ -57,10 +57,8 @@ fn derive_control_endpoint(enroll_url: &str) -> Option<String> {
         .trim_end_matches('/');
     if let Some(rest) = base.strip_prefix("https://") {
         Some(format!("wss://{rest}/agent-control"))
-    } else if let Some(rest) = base.strip_prefix("http://") {
-        Some(format!("ws://{rest}/agent-control"))
     } else {
-        None
+        base.strip_prefix("http://").map(|rest| format!("ws://{rest}/agent-control"))
     }
 }
 
