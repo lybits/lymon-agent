@@ -47,19 +47,20 @@ struct EnrollResponse {
     tenant_id: Option<String>,
 }
 
-/// Derive the control-channel WebSocket URL from the enrollment URL:
-///   https://host/api/agent/enroll → wss://host/agent-control
-///   http://host:3013/api/agent/enroll → ws://host:3013/agent-control
+/// Derive the control-channel WebSocket URL from the enrollment URL. The
+/// channel lives under /api so it rides the same proxy/ingress as the API:
+///   https://host/api/agent/enroll      → wss://host/api/agent-control
+///   http://host:3013/api/agent/enroll  → ws://host:3013/api/agent-control
 fn derive_control_endpoint(enroll_url: &str) -> Option<String> {
     let base = enroll_url
         .strip_suffix("/api/agent/enroll")
         .unwrap_or(enroll_url)
         .trim_end_matches('/');
     if let Some(rest) = base.strip_prefix("https://") {
-        Some(format!("wss://{rest}/agent-control"))
+        Some(format!("wss://{rest}/api/agent-control"))
     } else {
         base.strip_prefix("http://")
-            .map(|rest| format!("ws://{rest}/agent-control"))
+            .map(|rest| format!("ws://{rest}/api/agent-control"))
     }
 }
 
