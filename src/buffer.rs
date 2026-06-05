@@ -26,7 +26,7 @@
 // (ingested_batches table) ensures no duplicates.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OpenFlags};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::debug;
@@ -38,6 +38,9 @@ use crate::generated::lymon::ingest::v1::Sample;
 pub struct ClaimedBatch {
     pub batch_id: String,
     pub samples: Vec<Sample>,
+    /// Origin connector id for this batch, or None for the agent's default
+    /// datasource (legacy). All samples in a batch share one origin.
+    pub origin: Option<String>,
 }
 
 pub struct BufferDb {
@@ -74,7 +77,11 @@ impl BufferDb {
                 value        REAL NOT NULL,
                 quality      INTEGER NOT NULL DEFAULT 0,
                 attrs_json   TEXT,
-                batch_id     TEXT
+                batch_id     TEXT,
+                -- Origin connector/datasource id (Phase 2). NULL = the agent's
+                -- default datasource_id (legacy Modbus path). A batch carries a
+                -- single origin so the streamer attributes it correctly.
+                origin       TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_pending_batch
@@ -91,14 +98,34 @@ impl BufferDb {
         )
         .context("applying buffer schema")?;
 
+        // Add the `origin` column to buffers created before Phase 2. SQLite has
+        // no ADD COLUMN IF NOT EXISTS; ignore the duplicate-column error.
+        match conn.execute("ALTER TABLE pending_samples ADD COLUMN origin TEXT", []) {
+            Ok(_) => {}
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref msg)))
+                if msg.contains("duplicate column") => {}
+            Err(e) => return Err(e).context("adding origin column"),
+        }
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
-    /// Append samples to the buffer.
-    #[tracing::instrument(skip(self, samples), fields(sample_count = samples.len()))]
+    /// Append samples to the buffer under the agent's default origin (legacy
+    /// Modbus path). Equivalent to `enqueue_with_origin(None, …)`.
     pub async fn enqueue(&self, samples: Vec<Sample>) -> Result<()> {
+        self.enqueue_with_origin(None, samples).await
+    }
+
+    /// Append samples tagged with an origin connector id (Phase 2 collector).
+    /// `origin = None` uses the agent's default datasource at send time.
+    #[tracing::instrument(skip(self, samples), fields(sample_count = samples.len()))]
+    pub async fn enqueue_with_origin(
+        &self,
+        origin: Option<String>,
+        samples: Vec<Sample>,
+    ) -> Result<()> {
         if samples.is_empty() {
             return Ok(());
         }
@@ -109,8 +136,8 @@ impl BufferDb {
             {
                 let mut stmt = tx.prepare_cached(
                     "INSERT INTO pending_samples \
-                     (variable_id, ts_ms, value, quality, attrs_json) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                     (variable_id, ts_ms, value, quality, attrs_json, origin) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 )?;
                 for s in &samples {
                     let attrs_json = if s.attrs.is_empty() {
@@ -124,6 +151,7 @@ impl BufferDb {
                         s.value,
                         s.quality,
                         attrs_json,
+                        origin,
                     ])?;
                 }
             }
@@ -142,13 +170,27 @@ impl BufferDb {
             let mut conn = conn.lock().expect("buffer lock poisoned");
             let tx = conn.transaction()?;
 
+            // A batch carries a single origin so the streamer attributes it to
+            // the right connector. Pick the oldest unclaimed sample's origin,
+            // then claim same-origin rows only (`IS` is NULL-safe).
+            let origin: Option<String> = {
+                let mut stmt = tx.prepare_cached(
+                    "SELECT origin FROM pending_samples WHERE batch_id IS NULL ORDER BY id LIMIT 1",
+                )?;
+                let mut rows = stmt.query([])?;
+                match rows.next()? {
+                    Some(row) => row.get(0)?,
+                    None => return Ok(None),
+                }
+            };
+
             let ids: Vec<i64> = {
                 let mut stmt = tx.prepare_cached(
                     "SELECT id FROM pending_samples \
-                     WHERE batch_id IS NULL \
-                     ORDER BY id LIMIT ?1",
+                     WHERE batch_id IS NULL AND origin IS ?1 \
+                     ORDER BY id LIMIT ?2",
                 )?;
-                let rows = stmt.query_map([max_size as i64], |row| row.get(0))?;
+                let rows = stmt.query_map(params![origin, max_size as i64], |row| row.get(0))?;
                 rows.collect::<rusqlite::Result<Vec<i64>>>()?
             };
 
@@ -182,10 +224,15 @@ impl BufferDb {
             debug!(
                 batch_id = %batch_id,
                 count = samples.len(),
+                origin = ?origin,
                 "claimed batch from buffer"
             );
 
-            Ok(Some(ClaimedBatch { batch_id, samples }))
+            Ok(Some(ClaimedBatch {
+                batch_id,
+                samples,
+                origin,
+            }))
         })
         .await?
     }
@@ -250,7 +297,20 @@ impl BufferDb {
             let mut batches = Vec::with_capacity(batch_ids.len());
             for batch_id in batch_ids {
                 let samples = load_samples_for_batch(&conn, &batch_id)?;
-                batches.push(ClaimedBatch { batch_id, samples });
+                // All rows in a batch share one origin; read it from the first.
+                let origin: Option<String> = conn
+                    .query_row(
+                        "SELECT origin FROM pending_samples WHERE batch_id = ?1 LIMIT 1",
+                        params![batch_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                batches.push(ClaimedBatch {
+                    batch_id,
+                    samples,
+                    origin,
+                });
             }
 
             Ok(batches)
@@ -344,6 +404,49 @@ mod tests {
 
         let (pending, in_flight) = buffer.counts().await.unwrap();
         assert_eq!((pending, in_flight), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn claim_batch_groups_by_origin() {
+        let dir = tempdir().unwrap();
+        let buffer = BufferDb::open(dir.path().join("buf.db")).unwrap();
+
+        // Interleave two origins + a legacy (None) origin.
+        buffer
+            .enqueue_with_origin(Some("con_a".into()), vec![sample("a1", 1, 1.0)])
+            .await
+            .unwrap();
+        buffer
+            .enqueue_with_origin(Some("con_b".into()), vec![sample("b1", 2, 2.0)])
+            .await
+            .unwrap();
+        buffer
+            .enqueue(vec![sample("legacy", 3, 3.0)])
+            .await
+            .unwrap();
+        buffer
+            .enqueue_with_origin(Some("con_a".into()), vec![sample("a2", 4, 4.0)])
+            .await
+            .unwrap();
+
+        // First claim follows the oldest sample's origin (con_a) and pulls only
+        // its rows, not con_b's or the legacy one.
+        let first = buffer.claim_batch(10).await.unwrap().expect("batch");
+        assert_eq!(first.origin.as_deref(), Some("con_a"));
+        assert_eq!(first.samples.len(), 2);
+        assert!(first.samples.iter().all(|s| s.variable_id.starts_with('a')));
+        buffer.ack_ok(first.batch_id).await.unwrap();
+
+        // Next is con_b.
+        let second = buffer.claim_batch(10).await.unwrap().expect("batch");
+        assert_eq!(second.origin.as_deref(), Some("con_b"));
+        assert_eq!(second.samples.len(), 1);
+        buffer.ack_ok(second.batch_id).await.unwrap();
+
+        // Finally the legacy (None) origin.
+        let third = buffer.claim_batch(10).await.unwrap().expect("batch");
+        assert_eq!(third.origin, None);
+        assert_eq!(third.samples[0].variable_id, "legacy");
     }
 
     #[tokio::test]

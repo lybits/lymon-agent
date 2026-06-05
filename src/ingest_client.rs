@@ -182,7 +182,12 @@ impl BufferStreamer {
         let proto_batch = SampleBatch {
             batch_id: batch_id.clone(),
             agent_id: self.agent_id.clone(),
-            datasource_id: self.datasource_id.clone(),
+            // Per-batch origin: a collector batch is attributed to its connector;
+            // the legacy Modbus path (origin None) uses the agent's default.
+            datasource_id: claimed
+                .origin
+                .clone()
+                .unwrap_or_else(|| self.datasource_id.clone()),
             sent_at_ms: SystemTime::now()
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)

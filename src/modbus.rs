@@ -48,6 +48,35 @@ impl ModbusClient {
         Ok(())
     }
 
+    /// Read `count` registers starting at `start` (holding, or input when
+    /// `input=true`), reconnecting on failure. Used by the Phase-2 collector to
+    /// service a provisioned Modbus ingest's selection. Returns raw register
+    /// words; the caller scales/names them.
+    pub async fn read(&mut self, start: u16, count: u16, input: bool) -> Result<Vec<u16>> {
+        if self.ctx.is_none() {
+            self.connect().await?;
+        }
+        let ctx = self.ctx.as_mut().expect("connected");
+        let result = if input {
+            ctx.read_input_registers(start, count).await
+        } else {
+            ctx.read_holding_registers(start, count).await
+        };
+        match result {
+            Ok(Ok(regs)) => Ok(regs),
+            Ok(Err(exc)) => {
+                warn!(exception = ?exc, "Modbus exception, will reconnect");
+                self.ctx = None;
+                anyhow::bail!("Modbus exception: {exc:?}");
+            }
+            Err(e) => {
+                warn!(error = %e, "Modbus transport error, will reconnect");
+                self.ctx = None;
+                Err(e.into())
+            }
+        }
+    }
+
     /// Read all configured holding registers and convert to Samples.
     /// On any error, drops the connection so the next poll reconnects.
     #[tracing::instrument(skip(self), fields(register_count = self.register_count))]
