@@ -184,27 +184,51 @@ where
     Ok(())
 }
 
+/// Per-op row cap the agent enforces locally (matches the cloud default).
+const MAX_ROWS: usize = 100_000;
+
 async fn handle_query(req: Value, store: Store, tx: mpsc::UnboundedSender<Message>) {
     let request_id = req.get("request_id").and_then(Value::as_str).unwrap_or("").to_string();
     let ds_id = req.get("datasource_id").and_then(Value::as_str).unwrap_or("").to_string();
-    let ds_type = req.get("ds_type").and_then(Value::as_str).unwrap_or("").to_string();
     let op = req.get("op").and_then(Value::as_str).unwrap_or("").to_string();
+    let args = req.get("args").cloned().unwrap_or(Value::Null);
+    let timeout_ms = req.get("timeout_ms").and_then(Value::as_u64).unwrap_or(30_000);
 
-    // PR1: no local adapters yet. We know the datasource (provisioned) but
-    // can't execute the op — answer explicitly so the cloud surfaces a clear
-    // error instead of timing out. Adapters (postgresql/pss/http_rest/…) land
-    // in PR2 and will read `store` for config + secrets.
-    let known = { store.lock().await.contains_key(&ds_id) };
-    let detail = if known {
-        format!("agent has no adapter for {ds_type}.{op} yet")
-    } else {
-        format!("agent has no config for datasource {ds_id}")
+    // Clone the provisioned config out of the store so we don't hold the lock
+    // across the (awaiting) adapter call.
+    let ds = { store.lock().await.get(&ds_id).cloned() };
+    let Some(ds) = ds else {
+        respond_err(&tx, &request_id, "agent_unknown_datasource", &format!("agent has no config for datasource {ds_id}"));
+        return;
     };
+
+    // Dispatch to the local adapter for this datasource type. PR2 ships PSS;
+    // postgresql/http_rest/… follow.
+    let outcome = match ds.ds_type.as_str() {
+        "pss" => crate::pss::run(&op, &args, &ds.config, &ds.secrets, timeout_ms, MAX_ROWS).await,
+        other => Err(anyhow::anyhow!("agent has no adapter for {other}.{op} yet")),
+    };
+
+    match outcome {
+        Ok(result) => {
+            let resp = serde_json::json!({
+                "kind": "query_response",
+                "request_id": request_id,
+                "ok": true,
+                "result": result,
+            });
+            let _ = tx.send(Message::Text(resp.to_string()));
+        }
+        Err(e) => respond_err(&tx, &request_id, "agent_query_failed", &e.to_string()),
+    }
+}
+
+fn respond_err(tx: &mpsc::UnboundedSender<Message>, request_id: &str, code: &str, detail: &str) {
     let resp = serde_json::json!({
         "kind": "query_response",
         "request_id": request_id,
         "ok": false,
-        "error": { "code": "agent_unsupported", "detail": detail },
+        "error": { "code": code, "detail": detail },
     });
     let _ = tx.send(Message::Text(resp.to_string()));
 }

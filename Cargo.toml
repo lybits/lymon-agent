@@ -42,6 +42,11 @@ futures-util = "0.3"
 # wss handshake; we install `ring` in main(). Pinned to match tokio-tungstenite.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 
+# Gateway adapters: PSS (Circutor Power Studio) speaks XML over HTTP; dates are
+# DDMMYYYYHHmmss UTC.
+quick-xml = { version = "0.36", features = ["serialize"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+
 # Logging and tracing
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }

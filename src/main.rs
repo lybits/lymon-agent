@@ -23,6 +23,7 @@ mod control;
 mod enroll;
 mod ingest_client;
 mod modbus;
+mod pss;
 
 // Generated protobuf types.
 pub mod generated {
@@ -128,8 +129,8 @@ async fn main() -> Result<()> {
     let control_handle = if creds.tenant_id.is_some() && creds.control_endpoint.is_some() {
         let creds = creds.clone();
         Some(tokio::spawn(async move {
-            // PR1 advertises no gateway adapter capabilities yet.
-            control::run(creds, Vec::new()).await;
+            // Advertise the gateway adapters this agent can run locally.
+            control::run(creds, vec!["pss".to_string()]).await;
         }))
     } else {
         info!("control channel not configured (no tenant/control endpoint in credentials); gateway queries disabled");
