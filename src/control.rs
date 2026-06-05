@@ -339,6 +339,7 @@ fn parse_ingests(v: &Value) -> Vec<Ingest> {
                         selection: i.get("selection").cloned().unwrap_or(Value::Null),
                         interval_s: i.get("interval_s").and_then(Value::as_u64).unwrap_or(60),
                         naming: i.get("naming").cloned().unwrap_or(Value::Null),
+                        transform: i.get("transform").cloned().unwrap_or(Value::Null),
                     })
                 })
                 .collect()

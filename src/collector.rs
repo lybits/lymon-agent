@@ -45,6 +45,8 @@ pub struct Ingest {
     pub selection: Value,
     pub interval_s: u64,
     pub naming: Value,
+    /// Acquisition transform (scale/offset) applied before enqueue.
+    pub transform: Value,
 }
 
 pub struct Collector {
@@ -181,7 +183,7 @@ async fn collect_once(
                         format!("{var_id}/{i}")
                     },
                     ts_ms,
-                    value: raw as f64,
+                    value: apply_scale(raw as f64, &ing.transform),
                     quality: 0,
                     attrs: Default::default(),
                 })
@@ -202,13 +204,35 @@ async fn collect_once(
             Ok(vec![Sample {
                 variable_id: var_id,
                 ts_ms,
-                value,
+                value: apply_scale(value, &ing.transform),
                 quality: 0,
                 attrs: Default::default(),
             }])
         }
         other => anyhow::bail!("agent cannot collect connector type '{other}'"),
     }
+}
+
+/// Apply an ingest's linear acquisition transform: value = raw*scale + offset.
+/// Expression-based transforms are left to the cloud (the agent keeps raw);
+/// scale defaults to 1, offset to 0.
+fn apply_scale(raw: f64, transform: &Value) -> f64 {
+    if transform
+        .get("expression")
+        .and_then(Value::as_str)
+        .is_some()
+    {
+        return raw;
+    }
+    let scale = transform
+        .get("scale")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0);
+    let offset = transform
+        .get("offset")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    raw * scale + offset
 }
 
 /// Extract a scalar f64 from an adapter result ({kind:"scalar", value}).
