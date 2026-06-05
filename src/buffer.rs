@@ -163,9 +163,8 @@ impl BufferDb {
                 .as_millis() as i64;
 
             {
-                let mut stmt = tx.prepare_cached(
-                    "UPDATE pending_samples SET batch_id = ?1 WHERE id = ?2",
-                )?;
+                let mut stmt =
+                    tx.prepare_cached("UPDATE pending_samples SET batch_id = ?1 WHERE id = ?2")?;
                 for id in &ids {
                     stmt.execute(params![batch_id, id])?;
                 }
@@ -242,9 +241,8 @@ impl BufferDb {
             let conn = conn.lock().expect("buffer lock poisoned");
 
             let batch_ids: Vec<String> = {
-                let mut stmt = conn.prepare(
-                    "SELECT batch_id FROM in_flight_batches ORDER BY sent_at_ms",
-                )?;
+                let mut stmt =
+                    conn.prepare("SELECT batch_id FROM in_flight_batches ORDER BY sent_at_ms")?;
                 let rows = stmt.query_map([], |row| row.get(0))?;
                 rows.collect::<rusqlite::Result<Vec<String>>>()?
             };

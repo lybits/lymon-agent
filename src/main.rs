@@ -81,13 +81,10 @@ async fn main() -> Result<()> {
 
     // Open the durable buffer. Crashes here are fatal — better to fail loud
     // than to start without a buffer and risk silent data loss.
-    let buffer = Arc::new(
-        BufferDb::open(&cfg.buffer_path)
-            .map_err(|e| {
-                error!(error = %e, "failed to open buffer database");
-                e
-            })?,
-    );
+    let buffer = Arc::new(BufferDb::open(&cfg.buffer_path).map_err(|e| {
+        error!(error = %e, "failed to open buffer database");
+        e
+    })?);
 
     let (pending, in_flight) = buffer.counts().await?;
     info!(pending, in_flight, "buffer opened");
@@ -95,11 +92,8 @@ async fn main() -> Result<()> {
     // Spawn the Modbus reader. It pushes samples into the durable buffer.
     let modbus_handle = {
         let buffer = buffer.clone();
-        let mut modbus = ModbusClient::new(
-            cfg.modbus_host.clone(),
-            cfg.modbus_port,
-            cfg.register_count,
-        );
+        let mut modbus =
+            ModbusClient::new(cfg.modbus_host.clone(), cfg.modbus_port, cfg.register_count);
         let interval = Duration::from_millis(cfg.poll_interval_ms);
 
         tokio::spawn(async move {
@@ -159,9 +153,7 @@ fn init_tracing(otlp_endpoint: Option<&str>) -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("lymon_agent=info,tokio_modbus=warn"));
 
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_target(true)
-        .json();
+    let fmt_layer = tracing_subscriber::fmt::layer().with_target(true).json();
 
     let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
 

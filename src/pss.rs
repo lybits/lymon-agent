@@ -110,7 +110,10 @@ async fn query(
     let vars = require_vars(args)?;
     let path = format!(
         "/services/user/values.xml?var={}",
-        vars.iter().map(|v| urlencode(v)).collect::<Vec<_>>().join("?var=")
+        vars.iter()
+            .map(|v| urlencode(v))
+            .collect::<Vec<_>>()
+            .join("?var=")
     );
     let xml = get(client, base_url, &path, config, secrets).await?;
     let parsed: Values = quick_xml::de::from_str(&xml).context("parsing PSS values.xml")?;
@@ -149,8 +152,14 @@ async fn history(
     let vars = require_vars(args)?;
     let variable = &vars[0];
     let period = args.get("period").and_then(Value::as_str).unwrap_or("ALL");
-    let from = args.get("from").and_then(Value::as_str).ok_or_else(|| anyhow!("history requires `from`"))?;
-    let to = args.get("to").and_then(Value::as_str).ok_or_else(|| anyhow!("history requires `to`"))?;
+    let from = args
+        .get("from")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("history requires `from`"))?;
+    let to = args
+        .get("to")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("history requires `to`"))?;
     let begin = format_pss_date(parse_iso(from)?);
     let end = format_pss_date(parse_iso(to)?);
     let path = format!(
@@ -186,8 +195,20 @@ async fn history(
     Ok(json!({ "kind": "timeseries", "points": points }))
 }
 
-async fn discover(client: &Client, base_url: &str, config: &Value, secrets: &Value) -> Result<Value> {
-    let list_xml = get(client, base_url, "/services/user/devices.xml?info=ALL", config, secrets).await?;
+async fn discover(
+    client: &Client,
+    base_url: &str,
+    config: &Value,
+    secrets: &Value,
+) -> Result<Value> {
+    let list_xml = get(
+        client,
+        base_url,
+        "/services/user/devices.xml?info=ALL",
+        config,
+        secrets,
+    )
+    .await?;
     let ids: DevicesIds = quick_xml::de::from_str(&list_xml).context("parsing PSS devices.xml")?;
 
     let mut nodes: Vec<Value> = Vec::new();
@@ -209,7 +230,8 @@ async fn discover(client: &Client, base_url: &str, config: &Value, secrets: &Val
             .into_iter()
             .map(|v| json!({ "id": v, "label": v, "node_type": "variable", "meta": { "device": id } }))
             .collect();
-        nodes.push(json!({ "id": id, "label": label, "node_type": "device", "children": children }));
+        nodes
+            .push(json!({ "id": id, "label": label, "node_type": "device", "children": children }));
     }
     Ok(json!({ "kind": "tree", "schema_kind": "pss_devices", "nodes": nodes }))
 }
@@ -223,7 +245,10 @@ fn require_vars(args: &Value) -> Result<Vec<String>> {
         }
     }
     if let Some(arr) = args.get("variables").and_then(Value::as_array) {
-        let vars: Vec<String> = arr.iter().filter_map(|x| x.as_str().map(str::to_string)).collect();
+        let vars: Vec<String> = arr
+            .iter()
+            .filter_map(|x| x.as_str().map(str::to_string))
+            .collect();
         if !vars.is_empty() {
             return Ok(vars);
         }
@@ -253,10 +278,21 @@ async fn get(
 ) -> Result<String> {
     let url = format!("{base_url}{path}");
     let mut req = client.get(&url);
-    match config.get("auth").and_then(|a| a.get("type")).and_then(Value::as_str) {
+    match config
+        .get("auth")
+        .and_then(|a| a.get("type"))
+        .and_then(Value::as_str)
+    {
         Some("basic") => {
-            let user = config.get("auth").and_then(|a| a.get("username")).and_then(Value::as_str).unwrap_or("");
-            let pass = secrets.get("password").and_then(Value::as_str).unwrap_or("");
+            let user = config
+                .get("auth")
+                .and_then(|a| a.get("username"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let pass = secrets
+                .get("password")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             req = req.basic_auth(user, Some(pass));
         }
         Some("bearer") => {
@@ -281,7 +317,9 @@ fn urlencode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }
@@ -301,7 +339,8 @@ fn format_pss_date(dt: DateTime<Utc>) -> String {
 }
 
 fn parse_iso(s: &str) -> Result<DateTime<Utc>> {
-    let dt = DateTime::parse_from_rfc3339(s).with_context(|| format!("invalid ISO timestamp: {s}"))?;
+    let dt =
+        DateTime::parse_from_rfc3339(s).with_context(|| format!("invalid ISO timestamp: {s}"))?;
     Ok(dt.with_timezone(&Utc))
 }
 
@@ -310,12 +349,14 @@ fn parse_pss_date(input: &str) -> Option<DateTime<Utc>> {
     if s.len() < 14 {
         return None;
     }
-    let slice = |a: usize, b: usize| -> Option<i64> { s[a..b].iter().collect::<String>().parse().ok() };
+    let slice =
+        |a: usize, b: usize| -> Option<i64> { s[a..b].iter().collect::<String>().parse().ok() };
     let day = slice(0, 2)? as u32;
     let month = slice(2, 4)? as u32;
     let year = slice(4, 8)? as i32;
     let hour = slice(8, 10)? as u32;
     let min = slice(10, 12)? as u32;
     let sec = slice(12, 14)? as u32;
-    Utc.with_ymd_and_hms(year, month, day, hour, min, sec).single()
+    Utc.with_ymd_and_hms(year, month, day, hour, min, sec)
+        .single()
 }

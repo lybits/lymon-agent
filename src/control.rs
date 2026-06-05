@@ -55,7 +55,15 @@ pub async fn run(creds: Credentials, capabilities: Vec<String>) {
 
     let mut backoff = 1u64;
     loop {
-        match serve(&url, &creds.agent_id, &tenant_id, &creds.token, &capabilities).await {
+        match serve(
+            &url,
+            &creds.agent_id,
+            &tenant_id,
+            &creds.token,
+            &capabilities,
+        )
+        .await
+        {
             Ok(()) => info!("control channel closed by peer; reconnecting"),
             Err(e) => error!(error = %e, "control channel error; reconnecting"),
         }
@@ -120,7 +128,11 @@ async fn serve(
     result
 }
 
-async fn read_loop<S>(read: &mut S, tx: &mpsc::UnboundedSender<Message>, store: &Store) -> Result<()>
+async fn read_loop<S>(
+    read: &mut S,
+    tx: &mpsc::UnboundedSender<Message>,
+    store: &Store,
+) -> Result<()>
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
@@ -137,7 +149,10 @@ where
                         if v.get("ok").and_then(Value::as_bool).unwrap_or(false) {
                             info!("control channel authenticated");
                         } else {
-                            let detail = v.get("detail").and_then(Value::as_str).unwrap_or("rejected");
+                            let detail = v
+                                .get("detail")
+                                .and_then(Value::as_str)
+                                .unwrap_or("rejected");
                             anyhow::bail!("hello rejected: {detail}");
                         }
                     }
@@ -157,7 +172,11 @@ where
                                 s.insert(
                                     id.to_string(),
                                     ProvisionedDs {
-                                        ds_type: d.get("type").and_then(Value::as_str).unwrap_or("").to_string(),
+                                        ds_type: d
+                                            .get("type")
+                                            .and_then(Value::as_str)
+                                            .unwrap_or("")
+                                            .to_string(),
                                         config: d.get("config").cloned().unwrap_or(Value::Null),
                                         secrets: d.get("secrets").cloned().unwrap_or(Value::Null),
                                     },
@@ -188,17 +207,37 @@ where
 const MAX_ROWS: usize = 100_000;
 
 async fn handle_query(req: Value, store: Store, tx: mpsc::UnboundedSender<Message>) {
-    let request_id = req.get("request_id").and_then(Value::as_str).unwrap_or("").to_string();
-    let ds_id = req.get("datasource_id").and_then(Value::as_str).unwrap_or("").to_string();
-    let op = req.get("op").and_then(Value::as_str).unwrap_or("").to_string();
+    let request_id = req
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let ds_id = req
+        .get("datasource_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let op = req
+        .get("op")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let args = req.get("args").cloned().unwrap_or(Value::Null);
-    let timeout_ms = req.get("timeout_ms").and_then(Value::as_u64).unwrap_or(30_000);
+    let timeout_ms = req
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(30_000);
 
     // Clone the provisioned config out of the store so we don't hold the lock
     // across the (awaiting) adapter call.
     let ds = { store.lock().await.get(&ds_id).cloned() };
     let Some(ds) = ds else {
-        respond_err(&tx, &request_id, "agent_unknown_datasource", &format!("agent has no config for datasource {ds_id}"));
+        respond_err(
+            &tx,
+            &request_id,
+            "agent_unknown_datasource",
+            &format!("agent has no config for datasource {ds_id}"),
+        );
         return;
     };
 

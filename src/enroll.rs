@@ -58,14 +58,18 @@ fn derive_control_endpoint(enroll_url: &str) -> Option<String> {
     if let Some(rest) = base.strip_prefix("https://") {
         Some(format!("wss://{rest}/agent-control"))
     } else {
-        base.strip_prefix("http://").map(|rest| format!("ws://{rest}/agent-control"))
+        base.strip_prefix("http://")
+            .map(|rest| format!("ws://{rest}/agent-control"))
     }
 }
 
 /// credentials.json lives next to the buffer db (a writable, persistent dir).
 fn credentials_path(cfg: &Config) -> PathBuf {
     let buf = PathBuf::from(&cfg.buffer_path);
-    let dir = buf.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let dir = buf
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
     dir.join("credentials.json")
 }
 
@@ -81,9 +85,11 @@ pub async fn resolve(cfg: &Config) -> Result<Credentials> {
     }
 
     // 2) Direct env credentials (legacy / advanced).
-    if let (Some(agent_id), Some(token), Some(ingest_endpoint)) =
-        (cfg.agent_id.clone(), cfg.api_key.clone(), cfg.ingest_endpoint.clone())
-    {
+    if let (Some(agent_id), Some(token), Some(ingest_endpoint)) = (
+        cfg.agent_id.clone(),
+        cfg.api_key.clone(),
+        cfg.ingest_endpoint.clone(),
+    ) {
         info!(agent_id = %agent_id, "using credentials from environment");
         // Legacy/advanced path has no tenant/control endpoint → gateway control
         // channel stays disabled (ingest still works).
