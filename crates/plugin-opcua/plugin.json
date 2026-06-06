@@ -1,0 +1,8 @@
+{
+  "name": "lymon-plugin-opcua",
+  "version": "0.1.0",
+  "types": ["opcua"],
+  "exec": "./lymon-plugin-opcua",
+  "args": [],
+  "protocol": 1
+}

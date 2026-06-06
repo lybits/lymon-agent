@@ -1,0 +1,36 @@
+# OPC-UA connector plugin for the Lymon agent, built on the connector SDK.
+#
+# Intentionally EXCLUDED from the agent workspace (see ../../Cargo.toml
+# `[workspace] exclude`): it pulls a large dependency tree (async-opcua +
+# RustCrypto) that the lean rustls-pure agent binary must not carry. It builds
+# standalone with its own Cargo.lock — exactly the shape an external/3rd-party
+# plugin takes. Crucially async-opcua uses pure-Rust crypto (no OpenSSL/ring),
+# so this cross-compiles with no C toolchain or system OpenSSL.
+[package]
+name = "lymon-plugin-opcua"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "Lymon connector plugin: OPC-UA (built on the SDK, pure-Rust crypto)"
+repository = "https://github.com/lybits/lymon-agent"
+
+[[bin]]
+name = "lymon-plugin-opcua"
+path = "src/main.rs"
+
+[dependencies]
+lymon-collector-sdk = { path = "../collector-sdk" }
+serde_json = "1"
+# A small multi-thread runtime drives the async client; the OPC-UA event loop
+# runs on a worker thread so the session stays connected between polls.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+# async-opcua (FreeOpcUa) — the maintained successor to the locka99 `opcua`
+# crate. Pure-Rust crypto (RustCrypto: aes/rsa/sha2/x509-cert), no OpenSSL.
+opcua = { package = "async-opcua", version = "0.18", default-features = false, features = ["client"] }
+
+[profile.release]
+opt-level = "z"
+lto = "fat"
+codegen-units = 1
+strip = true

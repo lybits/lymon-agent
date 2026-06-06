@@ -11,6 +11,10 @@ repository = "https://github.com/lybits/lymon-agent"
 # are workspace members (built/linted together, not part of the agent binary).
 [workspace]
 members = ["crates/collector-sdk", "crates/plugin-s7"]
+# plugin-opcua is a heavy optional plugin (async-opcua + RustCrypto): kept out
+# of the agent build so the lean rustls-pure binary doesn't carry it. It builds
+# standalone with its own Cargo.lock — the same shape as a 3rd-party plugin.
+exclude = ["crates/plugin-opcua"]
 resolver = "2"
 
 [dependencies]
