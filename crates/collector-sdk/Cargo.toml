@@ -1,0 +1,11 @@
+[package]
+name = "lymon-collector-sdk"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "SDK for writing Lymon agent connector plugins (execd protocol v1)"
+repository = "https://github.com/lybits/lymon-agent"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

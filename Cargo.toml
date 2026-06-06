@@ -7,6 +7,12 @@ license = "Apache-2.0"
 description = "Lymon Edge Agent — industrial data collection and forwarding"
 repository = "https://github.com/lybits/lymon-agent"
 
+# The agent binary is the workspace root; the connector SDK + example plugins
+# are workspace members (built/linted together, not part of the agent binary).
+[workspace]
+members = ["crates/collector-sdk", "crates/plugin-s7"]
+resolver = "2"
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
