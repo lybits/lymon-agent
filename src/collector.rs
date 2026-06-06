@@ -25,6 +25,7 @@ use tracing::{error, info, warn};
 use crate::buffer::BufferDb;
 use crate::generated::lymon::ingest::v1::Sample;
 use crate::modbus::ModbusClient;
+use crate::plugins::PluginHost;
 
 /// Per-op row cap (matches the cloud default).
 const MAX_ROWS: usize = 100_000;
@@ -55,14 +56,17 @@ pub struct Collector {
     connectors: Arc<Mutex<HashMap<String, Conn>>>,
     /// ingest_id → running poll task.
     tasks: Mutex<HashMap<String, JoinHandle<()>>>,
+    /// Third-party connector plugins (execd), keyed by the types they serve.
+    plugins: Arc<PluginHost>,
 }
 
 impl Collector {
-    pub fn new(buffer: Arc<BufferDb>) -> Arc<Self> {
+    pub fn new(buffer: Arc<BufferDb>, plugins: Arc<PluginHost>) -> Arc<Self> {
         Arc::new(Self {
             buffer,
             connectors: Arc::new(Mutex::new(HashMap::new())),
             tasks: Mutex::new(HashMap::new()),
+            plugins,
         })
     }
 
@@ -95,8 +99,9 @@ impl Collector {
                 continue;
             };
             let buffer = self.buffer.clone();
+            let plugins = self.plugins.clone();
             let id = ing.ingest_id.clone();
-            let handle = tokio::spawn(async move { run_ingest(buffer, conn, ing).await });
+            let handle = tokio::spawn(async move { run_ingest(buffer, conn, ing, plugins).await });
             tasks.insert(id, handle);
         }
         info!(
@@ -111,7 +116,7 @@ impl Collector {
 /// records each reading. When `transform.sample_interval_ms` is set and finer
 /// than the record interval, it oversamples at that cadence and records the
 /// mean over each record window (edge downsampling: sample fast, store coarse).
-async fn run_ingest(buffer: Arc<BufferDb>, conn: Conn, ing: Ingest) {
+async fn run_ingest(buffer: Arc<BufferDb>, conn: Conn, ing: Ingest, plugins: Arc<PluginHost>) {
     let record = Duration::from_secs(ing.interval_s.max(1));
     // A persistent Modbus connection per task (None for other adapters).
     let mut modbus: Option<ModbusClient> = None;
@@ -130,12 +135,13 @@ async fn run_ingest(buffer: Arc<BufferDb>, conn: Conn, ing: Ingest) {
                 &conn,
                 &ing,
                 &mut modbus,
+                &plugins,
                 record,
                 Duration::from_millis(sample_ms.unwrap()),
             )
             .await;
         } else {
-            match collect_once(&conn, &ing, &mut modbus).await {
+            match collect_once(&conn, &ing, &mut modbus, &plugins).await {
                 Ok(samples) if !samples.is_empty() => {
                     if let Err(e) = buffer
                         .enqueue_with_origin(Some(ing.connector_id.clone()), samples)
@@ -159,13 +165,14 @@ async fn run_window(
     conn: &Conn,
     ing: &Ingest,
     modbus: &mut Option<ModbusClient>,
+    plugins: &Arc<PluginHost>,
     record: Duration,
     sample_every: Duration,
 ) {
     let start = Instant::now();
     let mut acc: HashMap<String, (f64, u32)> = HashMap::new();
     loop {
-        match collect_once(conn, ing, modbus).await {
+        match collect_once(conn, ing, modbus, plugins).await {
             Ok(samples) => {
                 for s in samples {
                     let e = acc.entry(s.variable_id).or_insert((0.0, 0));
@@ -212,6 +219,7 @@ async fn collect_once(
     conn: &Conn,
     ing: &Ingest,
     modbus: &mut Option<ModbusClient>,
+    plugins: &Arc<PluginHost>,
 ) -> Result<Vec<Sample>> {
     let ts_ms = now_ms();
     let var_id = ing
@@ -285,7 +293,20 @@ async fn collect_once(
                 attrs: Default::default(),
             }])
         }
-        other => anyhow::bail!("agent cannot collect connector type '{other}'"),
+        other => {
+            // Not a built-in protocol → try a third-party plugin (execd).
+            if let Some(plugin) = plugins.for_type(other) {
+                let mut samples = plugin.read(conn, ing).await?;
+                // Apply the ingest's scale/offset to plugin-returned values too.
+                for s in &mut samples {
+                    s.value = apply_scale(s.value, &ing.transform);
+                }
+                return Ok(samples);
+            }
+            anyhow::bail!(
+                "agent cannot collect connector type '{other}' (no built-in adapter or plugin)"
+            )
+        }
     }
 }
 

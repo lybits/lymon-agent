@@ -24,6 +24,7 @@ mod control;
 mod enroll;
 mod ingest_client;
 mod modbus;
+mod plugins;
 mod pss;
 
 // Generated protobuf types.
@@ -123,7 +124,15 @@ async fn main() -> Result<()> {
     // query execution (local adapters) lands in PR2.
     // Phase 2 collector: owns the buffer poll loops for provisioned ingests and
     // backs the control channel's connector store. Provision frames drive it.
-    let collector = crate::collector::Collector::new(buffer.clone());
+    // Third-party connector plugins (execd) are discovered from the plugins dir.
+    let plugins_dir = cfg.plugins_dir.clone().unwrap_or_else(|| {
+        std::path::Path::new(&cfg.buffer_path)
+            .parent()
+            .map(|p| p.join("plugins").to_string_lossy().into_owned())
+            .unwrap_or_else(|| "plugins".to_string())
+    });
+    let plugins = crate::plugins::PluginHost::discover(&plugins_dir, &cfg.plugins_allow);
+    let collector = crate::collector::Collector::new(buffer.clone(), plugins);
 
     let control_handle = if creds.tenant_id.is_some() && creds.control_endpoint.is_some() {
         let creds = creds.clone();

@@ -18,6 +18,12 @@ pub struct Config {
     // OpenTelemetry OTLP HTTP exporter endpoint (e.g. http://jaeger:4318)
     pub otlp_endpoint: Option<String>,
 
+    // Connector plugins (execd). Directory scanned for <name>/plugin.json, and
+    // an optional comma-separated allowlist of plugin names (empty = allow all
+    // discovered). Default dir is `<buffer-dir>/plugins`.
+    pub plugins_dir: Option<String>,
+    pub plugins_allow: Vec<String>,
+
     // --- Credentials: either provided directly (legacy) or obtained via a
     //     one-time enrollment code exchanged at first start. All optional
     //     here; resolved into concrete credentials by `enroll::resolve`. ---
@@ -43,6 +49,16 @@ impl Config {
             register_count: env_optional("LYMON_REGISTER_COUNT", "100").parse()?,
             buffer_path: env_optional("LYMON_BUFFER_PATH", "/var/lib/lymon-agent/buffer.db"),
             otlp_endpoint: std::env::var("LYMON_OTLP_ENDPOINT").ok(),
+            plugins_dir: std::env::var("LYMON_PLUGINS_DIR").ok(),
+            plugins_allow: std::env::var("LYMON_PLUGINS_ALLOW")
+                .ok()
+                .map(|s| {
+                    s.split(',')
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
             api_key: std::env::var("LYMON_API_KEY").ok(),
             agent_id: std::env::var("LYMON_AGENT_ID").ok(),
             ingest_endpoint: std::env::var("LYMON_INGEST_ENDPOINT").ok(),
