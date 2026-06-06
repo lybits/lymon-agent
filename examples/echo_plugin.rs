@@ -22,7 +22,8 @@ fn main() {
         }
         // A real plugin parses `req` (op/config/secrets/selection) and reads its
         // device here. This reference just returns a constant sample.
-        let resp = r#"{"ok":true,"samples":[{"variable_id":"example.value","value":42.0,"quality":0}]}"#;
+        let resp =
+            r#"{"ok":true,"samples":[{"variable_id":"example.value","value":42.0,"quality":0}]}"#;
         if writeln!(out, "{resp}").is_err() {
             break;
         }
