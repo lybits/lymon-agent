@@ -76,6 +76,12 @@ impl Collector {
         self.connectors.clone()
     }
 
+    /// The plugin host, shared with the control channel so a query_request for a
+    /// plugin-served connector type routes to the plugin (Browse/Test).
+    pub fn plugins(&self) -> Arc<PluginHost> {
+        self.plugins.clone()
+    }
+
     /// Replace the provisioned connectors + ingests and (re)start poll tasks.
     /// Full-replace: every running task is aborted and the desired set
     /// respawned, so removals/edits/pauses take effect without a restart.

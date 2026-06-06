@@ -61,6 +61,17 @@ struct ReadResp {
     error: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct QueryResp {
+    #[serde(default)]
+    ok: bool,
+    /// Adapter result Value (`{kind:"scalar"|"vector"|"tree", …}`).
+    #[serde(default)]
+    result: Value,
+    #[serde(default)]
+    error: Option<String>,
+}
+
 struct Proc {
     child: Child,
     stdin: ChildStdin,
@@ -105,6 +116,30 @@ impl Plugin {
                 attrs: Default::default(),
             })
             .collect())
+    }
+
+    /// Run an ad-hoc op (query / test / discover) through the plugin and return
+    /// the adapter result Value for the cloud's query_response. Same long-lived
+    /// process + respawn-on-error semantics as [`read`](Self::read).
+    pub async fn query(
+        &self,
+        op: &str,
+        ds_type: &str,
+        config: &Value,
+        secrets: &Value,
+        args: &Value,
+    ) -> Result<Value> {
+        let req = json!({
+            "v": PROTOCOL, "op": op,
+            "type": ds_type, "config": config, "secrets": secrets, "args": args,
+        });
+        let line = self.exchange(&req).await?;
+        let resp: QueryResp =
+            serde_json::from_str(&line).context("plugin response not valid JSON")?;
+        if !resp.ok {
+            return Err(anyhow!(resp.error.unwrap_or_else(|| "plugin error".into())));
+        }
+        Ok(resp.result)
     }
 
     /// Send one request line, read one response line. Manages spawn + respawn.
@@ -223,6 +258,13 @@ impl PluginHost {
 
     pub fn for_type(&self, ds_type: &str) -> Option<Arc<Plugin>> {
         self.by_type.get(ds_type).cloned()
+    }
+
+    /// The connector types served by discovered plugins — advertised in the
+    /// agent's control-channel capabilities so the cloud routes their queries
+    /// (Browse/Test) here.
+    pub fn types(&self) -> Vec<String> {
+        self.by_type.keys().cloned().collect()
     }
 }
 

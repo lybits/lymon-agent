@@ -16,14 +16,18 @@
 //   plugins/lymon-plugin-opcua/lymon-plugin-opcua   (this binary)
 // and create a connector type="opcua" host=agent in the portal.
 
+use std::cell::Cell;
+use std::future::Future;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use lymon_collector_sdk::{run, Collector, ReadRequest, Sample};
+use lymon_collector_sdk::{run, Collector, Discovery, Node, ReadRequest, Sample};
 use opcua::client::{Client, ClientBuilder, IdentityToken, Password, Session};
 use opcua::types::{
-    DataValue, MessageSecurityMode, NodeId, ReadValueId, StatusCode, TimestampsToReturn,
-    UserTokenPolicy, Variant,
+    BrowseDescription, BrowseDirection, DataValue, MessageSecurityMode, NodeClass, NodeId,
+    ObjectId, ReadValueId, ReferenceTypeId, StatusCode, TimestampsToReturn, UserTokenPolicy,
+    Variant,
 };
 use tokio::runtime::Runtime;
 
@@ -78,6 +82,47 @@ impl OpcUaConnector {
         session.wait_for_connection().await;
         Ok(session)
     }
+
+    /// Get a live session for `endpoint`, (re)connecting if we have none or it's
+    /// for a different endpoint. Shared by read() and discover().
+    fn session_for(
+        &mut self,
+        endpoint: &str,
+        identity: IdentityToken,
+    ) -> Result<Arc<Session>, String> {
+        let need_connect = match &self.conn {
+            Some(c) => c.endpoint != endpoint,
+            None => true,
+        };
+        if need_connect {
+            let session = self
+                .rt
+                .block_on(Self::connect(endpoint, identity))
+                .inspect_err(|_| {
+                    self.conn = None;
+                })?;
+            self.conn = Some(Conn {
+                endpoint: endpoint.to_string(),
+                session,
+            });
+        }
+        Ok(self.conn.as_ref().unwrap().session.clone())
+    }
+}
+
+/// Identity from `config.user` (+ `secrets.password`), else anonymous.
+fn identity_from(req: &ReadRequest) -> IdentityToken {
+    match req.config_str("user") {
+        Some(user) => {
+            let pass = req
+                .secrets
+                .get("password")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            IdentityToken::UserName(user.to_string(), Password(pass.to_string()))
+        }
+        None => IdentityToken::Anonymous,
+    }
 }
 
 /// SecurityPolicy::None as the wire string the endpoint tuple expects.
@@ -99,37 +144,7 @@ impl Collector for OpcUaConnector {
             .map_err(|_| format!("invalid node_id {node_str:?} (expected OPC-UA text form)"))?;
         let var_id = req.variable_id().unwrap_or("opcua.value").to_string();
 
-        // Identity: username/password if config.user is set, else anonymous.
-        let identity = match req.config_str("user") {
-            Some(user) => {
-                let pass = req
-                    .secrets
-                    .get("password")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                IdentityToken::UserName(user.to_string(), Password(pass.to_string()))
-            }
-            None => IdentityToken::Anonymous,
-        };
-
-        // (Re)connect if we have no live session for this endpoint.
-        let need_connect = match &self.conn {
-            Some(c) => c.endpoint != endpoint,
-            None => true,
-        };
-        if need_connect {
-            let session = self
-                .rt
-                .block_on(Self::connect(&endpoint, identity))
-                .inspect_err(|_| {
-                    self.conn = None;
-                })?;
-            self.conn = Some(Conn {
-                endpoint: endpoint.clone(),
-                session,
-            });
-        }
-        let session = self.conn.as_ref().unwrap().session.clone();
+        let session = self.session_for(&endpoint, identity_from(req))?;
 
         // One Read service call: newest value (max_age 0 = read from source).
         let to_read = vec![ReadValueId::from(node_id)];
@@ -158,6 +173,82 @@ impl Collector for OpcUaConnector {
         eprintln!("[opcua] {endpoint} {node_str} → {value}");
         Ok(vec![Sample::new(var_id, value)])
     }
+
+    /// Browse the address space into a node tree (source explorer). Starts at
+    /// `selection.node_id` if given (lazy subtree expand) else ObjectsFolder
+    /// (i=85), recursing up to MAX_DEPTH with a total-node budget.
+    fn discover(&mut self, req: &ReadRequest) -> Result<Discovery, String> {
+        let endpoint = req
+            .config_str("endpoint_url")
+            .ok_or("config.endpoint_url is required")?
+            .to_string();
+        let root = match req.selection.get("node_id").and_then(|v| v.as_str()) {
+            Some(s) => NodeId::from_str(s).map_err(|_| format!("invalid node_id {s:?}"))?,
+            None => ObjectId::ObjectsFolder.into(),
+        };
+        let session = self.session_for(&endpoint, identity_from(req))?;
+        let budget = Cell::new(MAX_NODES);
+        let nodes = self
+            .rt
+            .block_on(browse_node(&session, root, MAX_DEPTH, &budget));
+        Ok(Discovery {
+            schema_kind: "opcua_nodes".into(),
+            nodes,
+        })
+    }
+}
+
+/// Depth + total-node caps so a browse of a large server stays bounded.
+const MAX_DEPTH: u32 = 3;
+const MAX_NODES: usize = 500;
+
+/// Recursively browse hierarchical references under `node`, building a Node
+/// tree. Variables become leaves; objects/folders recurse until depth/budget
+/// run out. Errors at any node degrade to an empty child list (best-effort).
+fn browse_node<'a>(
+    session: &'a Session,
+    node: NodeId,
+    depth: u32,
+    budget: &'a Cell<usize>,
+) -> Pin<Box<dyn Future<Output = Vec<Node>> + 'a>> {
+    Box::pin(async move {
+        if depth == 0 || budget.get() == 0 {
+            return Vec::new();
+        }
+        let to_browse = [BrowseDescription {
+            node_id: node,
+            browse_direction: BrowseDirection::Forward,
+            reference_type_id: ReferenceTypeId::HierarchicalReferences.into(),
+            include_subtypes: true,
+            node_class_mask: 0,
+            result_mask: 0x3f,
+        }];
+        // max_references_per_node 0 = let the server decide; no View.
+        let results = match session.browse(&to_browse, 0, None).await {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+        let mut nodes = Vec::new();
+        for res in results {
+            let refs = res.references.unwrap_or_default();
+            for r in refs {
+                if budget.get() == 0 {
+                    break;
+                }
+                budget.set(budget.get() - 1);
+                let child_id = r.node_id.node_id.clone();
+                let id_text = child_id.to_string();
+                let label = r.display_name.text.to_string();
+                if r.node_class == NodeClass::Variable {
+                    nodes.push(Node::leaf(id_text, label, "variable"));
+                } else {
+                    let children = browse_node(session, child_id, depth - 1, budget).await;
+                    nodes.push(Node::branch(id_text, label, "folder", children));
+                }
+            }
+        }
+        nodes
+    })
 }
 
 /// Coerce an OPC-UA Variant into f64 (the warehouse stores numeric samples).

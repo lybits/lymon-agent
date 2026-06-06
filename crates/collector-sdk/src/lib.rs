@@ -1,8 +1,20 @@
 //! SDK for writing Lymon agent connector plugins (execd protocol v1, doc 32).
 //!
 //! A plugin is an executable the agent spawns and talks to over stdio: it reads
-//! one JSON request line per poll and writes one JSON response line. Implement
-//! [`Collector`] and call [`run`] — the SDK handles the framing.
+//! one JSON request line per request and writes one JSON response line.
+//! Implement [`Collector`] and call [`run`] — the SDK handles the framing.
+//!
+//! The agent sends three kinds of request (`op`):
+//! - `read` — a collect poll. Returns samples. Implement [`Collector::read`].
+//! - `query` / `test` — read one value to validate a selection (powers the
+//!   portal's "Test selection"). Defaults to [`Collector::read`] + the first
+//!   sample shaped as a scalar; override [`Collector::query`] for richer results.
+//! - `discover` — browse the source into a node tree (powers the portal source
+//!   explorer). Opt-in: implement [`Collector::discover`].
+//!
+//! For `query`/`test`/`discover` the agent puts the request parameters in
+//! `args`; the SDK copies `args` into `selection` when `selection` is absent, so
+//! a plugin that reads `selection` works for all of them without extra code.
 //!
 //! ```no_run
 //! use lymon_collector_sdk::{run, Collector, ReadRequest, Sample};
@@ -30,12 +42,12 @@ use serde_json::{json, Value};
 /// The protocol version this SDK implements.
 pub const PROTOCOL: u32 = 1;
 
-/// One request from the agent (a collect poll, or an ad-hoc query/test).
+/// One request from the agent (a collect poll, or an ad-hoc query/test/discover).
 #[derive(Debug, Deserialize)]
 pub struct ReadRequest {
     #[serde(default)]
     pub v: u32,
-    /// "read" (collect) or "query" (Browse/Test). Others are answered with ok.
+    /// "read" (collect), "query"/"test" (Browse a single value), or "discover".
     #[serde(default)]
     pub op: String,
     #[serde(default)]
@@ -49,9 +61,13 @@ pub struct ReadRequest {
     /// Resolved secrets (in-memory only; never log them).
     #[serde(default)]
     pub secrets: Value,
-    /// What to read (registers / nodes / db+byte / …).
+    /// What to read (registers / nodes / db+byte / …). For query/test/discover
+    /// the agent sends the params in `args`; the SDK mirrors them here.
     #[serde(default)]
     pub selection: Value,
+    /// Ad-hoc op parameters (query/test/discover). Mirrored into `selection`.
+    #[serde(default)]
+    pub args: Value,
     /// How the result maps to a variable (`{variable_id, unit, …}`).
     #[serde(default)]
     pub naming: Value,
@@ -93,9 +109,88 @@ impl Sample {
     }
 }
 
-/// Implement this for your connector. `read` is called once per poll.
+/// One node in a [`Discovery`] tree (a device, folder, or readable variable).
+/// `id` is what a selection would reference (e.g. an OPC-UA NodeId text form);
+/// `node_type` is a free label the portal shows ("folder" / "variable" / …);
+/// leaf nodes have an empty `children`.
+#[derive(Debug, Serialize)]
+pub struct Node {
+    pub id: String,
+    pub label: String,
+    pub node_type: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<Node>,
+    #[serde(skip_serializing_if = "Value::is_null")]
+    pub meta: Value,
+}
+
+impl Node {
+    /// A leaf (readable) node.
+    pub fn leaf(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        node_type: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            node_type: node_type.into(),
+            children: Vec::new(),
+            meta: Value::Null,
+        }
+    }
+    /// A branch node with children.
+    pub fn branch(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        node_type: impl Into<String>,
+        children: Vec<Node>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            node_type: node_type.into(),
+            children,
+            meta: Value::Null,
+        }
+    }
+}
+
+/// The result of a [`Collector::discover`] browse: a labelled node tree the
+/// portal renders as a source explorer. `schema_kind` is a free tag identifying
+/// the shape (e.g. "opcua_nodes").
+#[derive(Debug, Serialize)]
+pub struct Discovery {
+    pub schema_kind: String,
+    pub nodes: Vec<Node>,
+}
+
+/// Implement this for your connector.
+///
+/// Only [`read`](Collector::read) is required; [`query`](Collector::query)
+/// defaults to it (first sample as a scalar) and [`discover`](Collector::discover)
+/// defaults to "unsupported".
 pub trait Collector {
+    /// Read sample(s) for a collect poll. Called once per interval.
     fn read(&mut self, req: &ReadRequest) -> Result<Vec<Sample>, String>;
+
+    /// Read a single value to validate a selection ("Test"). Defaults to
+    /// [`read`](Collector::read) shaped as a scalar/vector; override for richer
+    /// results. Returns an adapter result `Value` (`{kind, value|values}`).
+    fn query(&mut self, req: &ReadRequest) -> Result<Value, String> {
+        let samples = self.read(req)?;
+        Ok(match samples.as_slice() {
+            [one] => json!({ "kind": "scalar", "value": one.value }),
+            many => {
+                json!({ "kind": "vector", "values": many.iter().map(|s| s.value).collect::<Vec<_>>() })
+            }
+        })
+    }
+
+    /// Browse the source into a node tree (source explorer). Opt-in.
+    fn discover(&mut self, _req: &ReadRequest) -> Result<Discovery, String> {
+        Err("discover not supported by this plugin".into())
+    }
 }
 
 /// Run the plugin: read request lines on stdin, dispatch to `collector`, write
@@ -109,12 +204,14 @@ pub fn run<C: Collector>(mut collector: C) {
             continue;
         }
         let resp = match serde_json::from_str::<ReadRequest>(&line) {
-            Ok(req) if req.op == "read" => match collector.read(&req) {
-                Ok(samples) => json!({ "ok": true, "samples": samples }),
-                Err(e) => json!({ "ok": false, "error": e }),
-            },
-            // hello / query / unknown — acknowledge so the agent stays in sync.
-            Ok(_) => json!({ "ok": true }),
+            Ok(mut req) => {
+                // For query/test/discover the agent sends params in `args`;
+                // mirror them into `selection` so a `read`-based plugin just works.
+                if req.selection.is_null() && !req.args.is_null() {
+                    req.selection = req.args.clone();
+                }
+                dispatch(&mut collector, &req)
+            }
             Err(e) => json!({ "ok": false, "error": format!("bad request: {e}") }),
         };
         if writeln!(out, "{resp}").is_err() {
@@ -123,5 +220,27 @@ pub fn run<C: Collector>(mut collector: C) {
         if out.flush().is_err() {
             break;
         }
+    }
+}
+
+fn dispatch<C: Collector>(collector: &mut C, req: &ReadRequest) -> Value {
+    match req.op.as_str() {
+        "read" => match collector.read(req) {
+            Ok(samples) => json!({ "ok": true, "samples": samples }),
+            Err(e) => json!({ "ok": false, "error": e }),
+        },
+        "discover" => match collector.discover(req) {
+            Ok(d) => json!({ "ok": true, "result": {
+                "kind": "tree", "schema_kind": d.schema_kind, "nodes": d.nodes,
+            } }),
+            Err(e) => json!({ "ok": false, "error": e }),
+        },
+        // query / test / history → a single value to validate a selection.
+        "query" | "test" | "history" => match collector.query(req) {
+            Ok(result) => json!({ "ok": true, "result": result }),
+            Err(e) => json!({ "ok": false, "error": e }),
+        },
+        // hello / unknown — acknowledge so the agent stays in sync.
+        _ => json!({ "ok": true }),
     }
 }

@@ -132,6 +132,10 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|| "plugins".to_string())
     });
     let plugins = crate::plugins::PluginHost::discover(&plugins_dir, &cfg.plugins_allow);
+    // Capture plugin-served types before the host moves into the collector, so
+    // we can advertise them as control-channel capabilities (Browse/Test route
+    // a query_request for e.g. `opcua` to its plugin).
+    let plugin_types = plugins.types();
     let collector = crate::collector::Collector::new(buffer.clone(), plugins);
 
     let control_handle = if creds.tenant_id.is_some() && creds.control_endpoint.is_some() {
@@ -139,13 +143,10 @@ async fn main() -> Result<()> {
         let collector = collector.clone();
         Some(tokio::spawn(async move {
             // Advertise the adapters this agent can run locally (gateway queries
-            // + collection).
-            control::run(
-                creds,
-                vec!["pss".to_string(), "modbus".to_string()],
-                collector,
-            )
-            .await;
+            // + collection): built-ins + every type served by a loaded plugin.
+            let mut capabilities = vec!["pss".to_string(), "modbus".to_string()];
+            capabilities.extend(plugin_types);
+            control::run(creds, capabilities, collector).await;
         }))
     } else {
         info!("control channel not configured (no tenant/control endpoint in credentials); gateway queries disabled");

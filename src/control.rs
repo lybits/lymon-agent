@@ -147,6 +147,7 @@ where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     let connectors = collector.connectors();
+    let plugins = collector.plugins();
     while let Some(frame) = read.next().await {
         let msg = frame.context("ws read")?;
         match msg {
@@ -209,7 +210,10 @@ where
                         let tx = tx.clone();
                         let store = store.clone();
                         let connectors = connectors.clone();
-                        tokio::spawn(async move { handle_query(v, store, connectors, tx).await });
+                        let plugins = plugins.clone();
+                        tokio::spawn(async move {
+                            handle_query(v, store, connectors, plugins, tx).await
+                        });
                     }
                     _ => {}
                 }
@@ -231,6 +235,7 @@ async fn handle_query(
     req: Value,
     store: Store,
     connectors: ConnStore,
+    plugins: Arc<crate::plugins::PluginHost>,
     tx: mpsc::UnboundedSender<Message>,
 ) {
     let request_id = req
@@ -278,10 +283,15 @@ async fn handle_query(
         return;
     };
 
-    // Dispatch to the local adapter for this origin's type.
+    // Dispatch to the local adapter for this origin's type. Built-ins first;
+    // any other type falls through to a connector plugin (execd) if one serves
+    // it — so Browse/Test work for plugin connectors (e.g. opcua), no recompile.
     let outcome = match ds_type.as_str() {
         "pss" => crate::pss::run(&op, &args, &config, &secrets, timeout_ms, MAX_ROWS).await,
-        other => Err(anyhow::anyhow!("agent has no adapter for {other}.{op} yet")),
+        other => match plugins.for_type(other) {
+            Some(plugin) => plugin.query(&op, other, &config, &secrets, &args).await,
+            None => Err(anyhow::anyhow!("agent has no adapter for {other}.{op} yet")),
+        },
     };
 
     match outcome {
