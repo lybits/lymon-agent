@@ -174,9 +174,10 @@ impl Collector for OpcUaConnector {
         Ok(vec![Sample::new(var_id, value)])
     }
 
-    /// Browse the address space into a node tree (source explorer). Starts at
-    /// `selection.node_id` if given (lazy subtree expand) else ObjectsFolder
-    /// (i=85), recursing up to MAX_DEPTH with a total-node budget.
+    /// Browse one level of the address space (source explorer, lazy). Starts at
+    /// `selection.node_id` if given (drill-down) else ObjectsFolder (i=85), and
+    /// returns the immediate children — the portal expands deeper on demand by
+    /// calling discover again with a child's node_id. Bounded by a node budget.
     fn discover(&mut self, req: &ReadRequest) -> Result<Discovery, String> {
         let endpoint = req
             .config_str("endpoint_url")
@@ -198,9 +199,10 @@ impl Collector for OpcUaConnector {
     }
 }
 
-/// Depth + total-node caps so a browse of a large server stays bounded.
-const MAX_DEPTH: u32 = 3;
-const MAX_NODES: usize = 500;
+/// Browse one level per call (lazy drill-down from the portal); a node budget
+/// caps very wide folders.
+const MAX_DEPTH: u32 = 1;
+const MAX_NODES: usize = 1000;
 
 /// Recursively browse hierarchical references under `node`, building a Node
 /// tree. Variables become leaves; objects/folders recurse until depth/budget
