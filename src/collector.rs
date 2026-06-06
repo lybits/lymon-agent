@@ -123,6 +123,22 @@ impl Collector {
 /// than the record interval, it oversamples at that cadence and records the
 /// mean over each record window (edge downsampling: sample fast, store coarse).
 async fn run_ingest(buffer: Arc<BufferDb>, conn: Conn, ing: Ingest, plugins: Arc<PluginHost>) {
+    // Subscribe-mode ingests (selection.subscribe = true) stream from a
+    // dedicated plugin process instead of polling. Only plugins push; built-in
+    // adapters are poll-only, so fall back to polling with a warning.
+    if ing
+        .selection
+        .get("subscribe")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        if plugins.for_type(&conn.ds_type).is_some() {
+            run_stream(buffer, conn, ing, plugins).await;
+            return;
+        }
+        warn!(ingest = %ing.ingest_id, ty = %conn.ds_type,
+            "subscribe ingest but no plugin for type; polling instead");
+    }
     let record = Duration::from_secs(ing.interval_s.max(1));
     // A persistent Modbus connection per task (None for other adapters).
     let mut modbus: Option<ModbusClient> = None;
@@ -161,6 +177,49 @@ async fn run_ingest(buffer: Arc<BufferDb>, conn: Conn, ing: Ingest, plugins: Arc
             }
             tokio::time::sleep(record).await;
         }
+    }
+}
+
+/// One subscribe-mode ingest: open a streaming plugin process and enqueue each
+/// pushed batch (with the ingest's scale/offset applied), reopening with a
+/// short backoff if the stream closes or errors. Runs until the task is aborted
+/// (a reconfigure), which drops the stream and kills the process.
+async fn run_stream(buffer: Arc<BufferDb>, conn: Conn, ing: Ingest, plugins: Arc<PluginHost>) {
+    let Some(plugin) = plugins.for_type(&conn.ds_type) else {
+        return;
+    };
+    info!(ingest = %ing.ingest_id, connector = %ing.connector_id, ty = %conn.ds_type,
+        "collector subscription started");
+    loop {
+        match plugin.open_stream(&conn, &ing).await {
+            Ok(mut stream) => loop {
+                match stream.next().await {
+                    Ok(Some(mut samples)) => {
+                        for s in &mut samples {
+                            s.value = apply_scale(s.value, &ing.transform);
+                        }
+                        if let Err(e) = buffer
+                            .enqueue_with_origin(Some(ing.connector_id.clone()), samples)
+                            .await
+                        {
+                            error!(ingest = %ing.ingest_id, error = %e, "subscription enqueue failed");
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(ingest = %ing.ingest_id, "subscription stream closed; reopening");
+                        break;
+                    }
+                    Err(e) => {
+                        warn!(ingest = %ing.ingest_id, error = %e, "subscription error; reopening");
+                        break;
+                    }
+                }
+            },
+            Err(e) => {
+                warn!(ingest = %ing.ingest_id, error = %e, "open subscription failed; retrying")
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 

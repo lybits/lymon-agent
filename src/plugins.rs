@@ -142,6 +142,40 @@ impl Plugin {
         Ok(resp.result)
     }
 
+    /// Open a subscription (push): spawn a DEDICATED process (not the shared
+    /// request/response one), send one `subscribe` request, and return a stream
+    /// the caller drains. The process streams `{samples}` lines until killed;
+    /// dropping the returned [`PluginStream`] kills it (kill_on_drop).
+    pub async fn open_stream(&self, conn: &Conn, ing: &Ingest) -> Result<PluginStream> {
+        info!(plugin = %self.name, ingest = %ing.ingest_id, "opening plugin subscription");
+        let mut child = Command::new(&self.exec)
+            .args(&self.args)
+            .current_dir(&self.dir)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawning plugin {} (subscribe)", self.name))?;
+        let mut stdin = child.stdin.take().context("plugin stdin")?;
+        let stdout = BufReader::new(child.stdout.take().context("plugin stdout")?).lines();
+        let req = json!({
+            "v": PROTOCOL, "op": "subscribe",
+            "connector_id": ing.connector_id, "type": conn.ds_type,
+            "config": conn.config, "secrets": conn.secrets,
+            "selection": ing.selection, "naming": ing.naming,
+        });
+        stdin
+            .write_all(format!("{req}\n").as_bytes())
+            .await
+            .context("sending subscribe request")?;
+        let _ = stdin.flush().await;
+        // The subscribe op never reads more input; closing stdin is harmless
+        // (the process blocks streaming) and avoids holding a dangling handle.
+        drop(stdin);
+        Ok(PluginStream { child, stdout })
+    }
+
     /// Send one request line, read one response line. Manages spawn + respawn.
     async fn exchange(&self, req: &Value) -> Result<String> {
         let mut guard = self.proc.lock().await;
@@ -189,6 +223,53 @@ impl Plugin {
             stdin,
             stdout,
         })
+    }
+}
+
+/// A live plugin subscription: a dedicated process pushing sample lines. Held
+/// by the collector's stream task; dropping it kills the process (kill_on_drop
+/// was set at spawn), so a reconfigure that aborts the task tears it down.
+pub struct PluginStream {
+    // Held to keep the process alive; reaped on drop. Not read directly.
+    #[allow(dead_code)]
+    child: Child,
+    stdout: Lines<BufReader<ChildStdout>>,
+}
+
+impl PluginStream {
+    /// Await the next pushed batch. `Ok(None)` = the stream closed (process
+    /// exited); empty/ack lines are skipped. Ts/quality default like `read`.
+    pub async fn next(&mut self) -> Result<Option<Vec<Sample>>> {
+        loop {
+            let line = match self.stdout.next_line().await? {
+                Some(l) if !l.trim().is_empty() => l,
+                Some(_) => continue,
+                None => return Ok(None),
+            };
+            let resp: ReadResp =
+                serde_json::from_str(&line).context("plugin stream line not valid JSON")?;
+            if !resp.ok {
+                return Err(anyhow!(resp
+                    .error
+                    .unwrap_or_else(|| "plugin stream error".into())));
+            }
+            if resp.samples.is_empty() {
+                continue; // ack / keepalive
+            }
+            let now = now_ms();
+            return Ok(Some(
+                resp.samples
+                    .into_iter()
+                    .map(|s| Sample {
+                        variable_id: s.variable_id,
+                        ts_ms: s.ts_ms.unwrap_or(now),
+                        value: s.value,
+                        quality: s.quality.unwrap_or(0),
+                        attrs: Default::default(),
+                    })
+                    .collect(),
+            ));
+        }
     }
 }
 

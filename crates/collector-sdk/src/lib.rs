@@ -191,6 +191,19 @@ pub trait Collector {
     fn discover(&mut self, _req: &ReadRequest) -> Result<Discovery, String> {
         Err("discover not supported by this plugin".into())
     }
+
+    /// Stream samples as the source pushes them (e.g. OPC-UA subscriptions /
+    /// monitored items), instead of being polled. Opt-in. Call `emit` with each
+    /// batch as it arrives; this method BLOCKS, running the subscription until
+    /// the agent kills the process (a reconfigure / shutdown). The agent runs a
+    /// dedicated plugin process per subscription, so the loop owns the process.
+    fn subscribe(
+        &mut self,
+        _req: &ReadRequest,
+        _emit: &mut dyn FnMut(&[Sample]),
+    ) -> Result<(), String> {
+        Err("subscribe (push) not supported by this plugin".into())
+    }
 }
 
 /// Run the plugin: read request lines on stdin, dispatch to `collector`, write
@@ -203,17 +216,32 @@ pub fn run<C: Collector>(mut collector: C) {
         if line.trim().is_empty() {
             continue;
         }
-        let resp = match serde_json::from_str::<ReadRequest>(&line) {
+        let req = match serde_json::from_str::<ReadRequest>(&line) {
             Ok(mut req) => {
-                // For query/test/discover the agent sends params in `args`;
-                // mirror them into `selection` so a `read`-based plugin just works.
+                // For query/test/discover/subscribe the agent sends params in
+                // `args`; mirror into `selection` so a `read`-based plugin works.
                 if req.selection.is_null() && !req.args.is_null() {
                     req.selection = req.args.clone();
                 }
-                dispatch(&mut collector, &req)
+                req
             }
-            Err(e) => json!({ "ok": false, "error": format!("bad request: {e}") }),
+            Err(e) => {
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    json!({ "ok": false, "error": format!("bad request: {e}") })
+                );
+                let _ = out.flush();
+                continue;
+            }
         };
+        // Subscribe is a streaming op: it emits sample lines as values arrive
+        // and blocks until the source/process ends, so it owns the write side.
+        if req.op == "subscribe" {
+            stream(&mut collector, &req, &mut out);
+            continue;
+        }
+        let resp = dispatch(&mut collector, &req);
         if writeln!(out, "{resp}").is_err() {
             break;
         }
@@ -221,6 +249,25 @@ pub fn run<C: Collector>(mut collector: C) {
             break;
         }
     }
+}
+
+/// Run a subscription: emit `{ok,samples}` lines as the collector pushes them,
+/// then a final status line when it ends. Blocks for the subscription's life.
+fn stream<C: Collector, W: Write>(collector: &mut C, req: &ReadRequest, out: &mut W) {
+    let result = {
+        let mut emit = |samples: &[Sample]| {
+            let line = json!({ "ok": true, "samples": samples });
+            let _ = writeln!(out, "{line}");
+            let _ = out.flush();
+        };
+        collector.subscribe(req, &mut emit)
+    };
+    let resp = match result {
+        Ok(()) => json!({ "ok": true }),
+        Err(e) => json!({ "ok": false, "error": e }),
+    };
+    let _ = writeln!(out, "{resp}");
+    let _ = out.flush();
 }
 
 fn dispatch<C: Collector>(collector: &mut C, req: &ReadRequest) -> Value {

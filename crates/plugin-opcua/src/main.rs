@@ -21,13 +21,14 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use lymon_collector_sdk::{run, Collector, Discovery, Node, ReadRequest, Sample};
-use opcua::client::{Client, ClientBuilder, IdentityToken, Password, Session};
+use opcua::client::{Client, ClientBuilder, DataChangeCallback, IdentityToken, Password, Session};
 use opcua::types::{
-    BrowseDescription, BrowseDirection, DataValue, MessageSecurityMode, NodeClass, NodeId,
-    ObjectId, ReadValueId, ReferenceTypeId, StatusCode, TimestampsToReturn, UserTokenPolicy,
-    Variant,
+    BrowseDescription, BrowseDirection, DataValue, MessageSecurityMode, MonitoredItemCreateRequest,
+    NodeClass, NodeId, ObjectId, ReadValueId, ReferenceTypeId, StatusCode, TimestampsToReturn,
+    UserTokenPolicy, Variant,
 };
 use tokio::runtime::Runtime;
 
@@ -196,6 +197,58 @@ impl Collector for OpcUaConnector {
             schema_kind: "opcua_nodes".into(),
             nodes,
         })
+    }
+
+    /// Stream value changes for `selection.node_id` via an OPC-UA subscription +
+    /// monitored item. The data-change callback (on the event loop) feeds a
+    /// channel; this blocks emitting each change until the process is killed.
+    fn subscribe(
+        &mut self,
+        req: &ReadRequest,
+        emit: &mut dyn FnMut(&[Sample]),
+    ) -> Result<(), String> {
+        let endpoint = req
+            .config_str("endpoint_url")
+            .ok_or("config.endpoint_url is required")?
+            .to_string();
+        let node_str = req
+            .selection
+            .get("node_id")
+            .and_then(|v| v.as_str())
+            .ok_or("selection.node_id is required")?;
+        let node =
+            NodeId::from_str(node_str).map_err(|_| format!("invalid node_id {node_str:?}"))?;
+        let var_id = req.variable_id().unwrap_or("opcua.value").to_string();
+        let session = self.session_for(&endpoint, identity_from(req))?;
+
+        // The async data-change callback feeds this channel; the sync loop below
+        // drains it. tokio's sender is Send+Sync (the callback needs that).
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+        self.rt.block_on(async {
+            let cb = DataChangeCallback::new(move |dv: DataValue, _item: &_| {
+                if let Some(v) = dv.value.as_ref().and_then(variant_to_f64) {
+                    let _ = tx.send(v);
+                }
+            });
+            let sub_id = session
+                .create_subscription(Duration::from_millis(1000), 10, 30, 0, 0, true, cb)
+                .await
+                .map_err(|e| format!("create_subscription: {e}"))?;
+            let item: MonitoredItemCreateRequest = node.into();
+            session
+                .create_monitored_items(sub_id, TimestampsToReturn::Both, vec![item])
+                .await
+                .map_err(|e| format!("create_monitored_items: {e}"))?;
+            Ok::<(), String>(())
+        })?;
+        eprintln!("[opcua] subscribed {endpoint} {node_str}");
+
+        // Block emitting each pushed value. recv() ends when the process is
+        // killed (agent reconfigure/shutdown) and the runtime/session tear down.
+        while let Some(v) = rx.blocking_recv() {
+            emit(&[Sample::new(&var_id, v)]);
+        }
+        Ok(())
     }
 }
 
