@@ -155,7 +155,11 @@ impl BufferStreamer {
                     backoff_secs.store(1, Ordering::Relaxed);
                     batches_sent += 1;
                     if batches_sent % 100 == 0 {
-                        debug!(batches_sent, "progress");
+                        debug!(
+                            batches_sent,
+                            samples_dropped = self.buffer.dropped_total(),
+                            "progress"
+                        );
                     }
                 }
                 None => {
@@ -200,22 +204,29 @@ impl BufferStreamer {
             .await
             .context("failed to push batch onto stream")?;
 
-        // gRPC bidirectional streams preserve order within each direction,
-        // so the next ACK corresponds to this batch.
-        let ack = match inbound.message().await? {
-            Some(a) => a,
-            None => anyhow::bail!("server closed ACK stream unexpectedly"),
+        // Resolve the ACK by batch_id, never by arrival order. This streamer
+        // is strictly lock-step (exactly one batch in flight per
+        // send_and_ack call), so id-based resolution reduces to: keep
+        // reading ACKs until one names the in-flight batch, discarding
+        // unknown ones with a warn. Applying a mismatched ACK's status to
+        // the in-flight batch could delete undelivered samples from the
+        // buffer (breaking exactly-once) if the server ever pipelines,
+        // duplicates, or reorders ACKs. A full in-flight map only becomes
+        // necessary if the streamer itself starts pipelining batches.
+        let (status, detail) = loop {
+            let ack = match inbound.message().await? {
+                Some(a) => a,
+                None => anyhow::bail!("server closed ACK stream unexpectedly"),
+            };
+            match resolve_ack(&ack, &batch_id) {
+                Some(status) => break (status, ack.detail),
+                None => warn!(
+                    expected = %batch_id,
+                    received = %ack.batch_id,
+                    "discarding ACK for unknown batch (not in flight)"
+                ),
+            }
         };
-
-        if ack.batch_id != batch_id {
-            warn!(
-                expected = %batch_id,
-                received = %ack.batch_id,
-                "ACK batch_id mismatch — gRPC ordering violated?"
-            );
-        }
-
-        let status = AckStatus::try_from(ack.status).unwrap_or(AckStatus::Unspecified);
         match status {
             AckStatus::Ok | AckStatus::Duplicate => {
                 debug!(
@@ -229,7 +240,7 @@ impl BufferStreamer {
             AckStatus::Rejected => {
                 warn!(
                     batch_id = %batch_id,
-                    detail = %ack.detail,
+                    detail = %detail,
                     "batch REJECTED — dropping samples"
                 );
                 // Permanently drop rather than retry forever.
@@ -238,7 +249,7 @@ impl BufferStreamer {
             AckStatus::Retry => {
                 warn!(
                     batch_id = %batch_id,
-                    detail = %ack.detail,
+                    detail = %detail,
                     "batch RETRY — returning to pending"
                 );
                 self.buffer.ack_retry(batch_id).await?;
@@ -253,5 +264,67 @@ impl BufferStreamer {
         }
 
         Ok(())
+    }
+}
+
+/// Match an incoming ACK against the batch currently in flight. Returns the
+/// decoded status when the ACK names that batch, or `None` when it references
+/// a different (unknown) batch and must be discarded — a status must never be
+/// applied to a batch the ACK does not name.
+fn resolve_ack(ack: &BatchAck, in_flight_batch_id: &str) -> Option<AckStatus> {
+    if ack.batch_id != in_flight_batch_id {
+        return None;
+    }
+    Some(AckStatus::try_from(ack.status).unwrap_or(AckStatus::Unspecified))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ack(batch_id: &str, status: i32) -> BatchAck {
+        BatchAck {
+            batch_id: batch_id.to_string(),
+            status,
+            detail: String::new(),
+        }
+    }
+
+    #[test]
+    fn resolve_ack_matches_in_flight_batch() {
+        let a = ack("01ARZ3NDEKTSV4RRFFQ69G5FAV", AckStatus::Ok as i32);
+        assert_eq!(
+            resolve_ack(&a, "01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+            Some(AckStatus::Ok)
+        );
+    }
+
+    #[test]
+    fn resolve_ack_discards_unknown_batch() {
+        // An ACK for a batch we don't have in flight must NOT resolve — its
+        // status (here RETRY) must never be applied to the in-flight batch.
+        let a = ack("other-batch", AckStatus::Retry as i32);
+        assert_eq!(resolve_ack(&a, "in-flight-batch"), None);
+    }
+
+    #[test]
+    fn resolve_ack_decodes_every_status_for_matching_batch() {
+        for status in [
+            AckStatus::Ok,
+            AckStatus::Duplicate,
+            AckStatus::Rejected,
+            AckStatus::Retry,
+        ] {
+            let a = ack("b1", status as i32);
+            assert_eq!(resolve_ack(&a, "b1"), Some(status));
+        }
+    }
+
+    #[test]
+    fn resolve_ack_maps_unknown_status_to_unspecified() {
+        // Unknown enum value from a newer server → Unspecified (treated as
+        // retry by the caller), not a panic or a silent drop.
+        let a = ack("b1", 999);
+        assert_eq!(resolve_ack(&a, "b1"), Some(AckStatus::Unspecified));
     }
 }

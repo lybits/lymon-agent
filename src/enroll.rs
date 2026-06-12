@@ -137,9 +137,72 @@ pub async fn resolve(cfg: &Config) -> Result<Credentials> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).ok();
     }
-    std::fs::write(&path, serde_json::to_vec_pretty(&creds)?)
+    write_credentials_file(&path, &serde_json::to_vec_pretty(&creds)?)
         .with_context(|| format!("saving credentials to {}", path.display()))?;
     info!(agent_id = %creds.agent_id, path = %path.display(), "enrolled — credentials saved");
 
     Ok(creds)
+}
+
+/// Write credentials.json owner-read/write only (0600): it holds the agent's
+/// bearer token, so the default umask (typically 0644) would expose it to
+/// every local user. On unix the file is created with mode 0600 and, in case
+/// it already existed with laxer permissions from an older agent version,
+/// permissions are re-applied on every rewrite. On non-unix targets this
+/// degrades to a plain write (no POSIX modes there).
+fn write_credentials_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600) // only effective when the file is created
+            .open(path)?;
+        // The mode above is ignored for pre-existing files: tighten those too.
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        file.write_all(bytes)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn credentials_file_created_with_0600() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        write_credentials_file(&path, b"{\"token\":\"secret\"}").unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"{\"token\":\"secret\"}".to_vec()
+        );
+    }
+
+    #[test]
+    fn rewrite_tightens_lax_permissions_on_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("credentials.json");
+        std::fs::write(&path, b"old-and-longer-content-here").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        write_credentials_file(&path, b"new").unwrap();
+
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        // truncate(true): no stale tail from the longer previous content.
+        assert_eq!(std::fs::read(&path).unwrap(), b"new".to_vec());
+    }
 }

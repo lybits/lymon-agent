@@ -318,7 +318,17 @@ async fn collect_once(
                 .unwrap_or(1) as u16;
             let input = ing.selection.get("type").and_then(Value::as_str) == Some("input");
             if modbus.is_none() {
-                *modbus = Some(ModbusClient::new(host.to_string(), port, count));
+                // Per-op I/O deadline scales with the ingest cadence (the
+                // client clamps it to [5s, 30s]); see ModbusClient::new. This
+                // gives the collector's Modbus reads the same half-open-PLC
+                // timeout protection as the legacy default-datasource poller.
+                let poll_interval = Duration::from_secs(ing.interval_s.max(1));
+                *modbus = Some(ModbusClient::new(
+                    host.to_string(),
+                    port,
+                    count,
+                    poll_interval,
+                ));
             }
             let regs = modbus.as_mut().unwrap().read(start, count, input).await?;
             let n = regs.len();

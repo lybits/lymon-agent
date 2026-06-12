@@ -78,15 +78,18 @@ async fn main() -> Result<()> {
         poll_ms = cfg.poll_interval_ms,
         registers = cfg.register_count,
         buffer_path = %cfg.buffer_path,
+        buffer_max_rows = cfg.buffer_max_rows,
         "lymon-agent starting (Día 3 — durable SQLite WAL buffer)"
     );
 
     // Open the durable buffer. Crashes here are fatal — better to fail loud
     // than to start without a buffer and risk silent data loss.
-    let buffer = Arc::new(BufferDb::open(&cfg.buffer_path).map_err(|e| {
-        error!(error = %e, "failed to open buffer database");
-        e
-    })?);
+    let buffer = Arc::new(
+        BufferDb::open(&cfg.buffer_path, cfg.buffer_max_rows).map_err(|e| {
+            error!(error = %e, "failed to open buffer database");
+            e
+        })?,
+    );
 
     let (pending, in_flight) = buffer.counts().await?;
     info!(pending, in_flight, "buffer opened");
@@ -94,21 +97,36 @@ async fn main() -> Result<()> {
     // Spawn the Modbus reader. It pushes samples into the durable buffer.
     let modbus_handle = {
         let buffer = buffer.clone();
-        let mut modbus =
-            ModbusClient::new(cfg.modbus_host.clone(), cfg.modbus_port, cfg.register_count);
         let interval = Duration::from_millis(cfg.poll_interval_ms);
+        let mut modbus = ModbusClient::new(
+            cfg.modbus_host.clone(),
+            cfg.modbus_port,
+            cfg.register_count,
+            interval,
+        );
 
         tokio::spawn(async move {
+            // Retry with exponential backoff so a dead PLC isn't hammered
+            // every second; reset after the first successful poll (same
+            // pattern as the ingest streamer's reconnect backoff).
+            let mut backoff_secs: u64 = 1;
+            let max_backoff: u64 = 30;
             loop {
                 match modbus.poll().await {
                     Ok(samples) => {
+                        backoff_secs = 1;
                         if let Err(e) = buffer.enqueue(samples).await {
                             error!(error = %e, "failed to enqueue samples to buffer");
                         }
                     }
                     Err(e) => {
-                        error!(error = %e, "Modbus poll failed; retry in 1s");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        error!(
+                            error = %e,
+                            backoff_secs,
+                            "Modbus poll failed; will retry"
+                        );
+                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+                        backoff_secs = (backoff_secs * 2).min(max_backoff);
                         continue;
                     }
                 }
