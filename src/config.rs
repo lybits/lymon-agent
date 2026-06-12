@@ -15,6 +15,11 @@ pub struct Config {
     // Location of the SQLite WAL buffer; agent credentials are stored
     // alongside it (credentials.json) after enrollment.
     pub buffer_path: String,
+    // High-water mark for the buffer (max rows in pending_samples). When
+    // exceeded, the oldest pending samples are dropped so an extended cloud
+    // outage cannot fill the device disk (helm PV is 1Gi). See
+    // buffer::DEFAULT_MAX_ROWS for the sizing rationale (~68 bytes/row).
+    pub buffer_max_rows: u64,
     // OpenTelemetry OTLP HTTP exporter endpoint (e.g. http://jaeger:4318)
     pub otlp_endpoint: Option<String>,
 
@@ -42,6 +47,11 @@ impl Config {
             poll_interval_ms: env_optional("LYMON_POLL_INTERVAL_MS", "100").parse()?,
             register_count: env_optional("LYMON_REGISTER_COUNT", "100").parse()?,
             buffer_path: env_optional("LYMON_BUFFER_PATH", "/var/lib/lymon-agent/buffer.db"),
+            buffer_max_rows: env_optional(
+                "LYMON_BUFFER_MAX_ROWS",
+                &crate::buffer::DEFAULT_MAX_ROWS.to_string(),
+            )
+            .parse()?,
             otlp_endpoint: std::env::var("LYMON_OTLP_ENDPOINT").ok(),
             api_key: std::env::var("LYMON_API_KEY").ok(),
             agent_id: std::env::var("LYMON_AGENT_ID").ok(),

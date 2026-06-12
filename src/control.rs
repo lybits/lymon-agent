@@ -42,6 +42,11 @@ struct ProvisionedDs {
 
 type Store = Arc<Mutex<HashMap<String, ProvisionedDs>>>;
 
+/// Capacity of the queue in front of the single WS writer task. Small on
+/// purpose: it only needs to absorb short writer hiccups; sustained slowness
+/// must push back on producers, not buffer 100k-row responses in memory.
+const WRITER_QUEUE: usize = 32;
+
 /// Run the control channel forever: connect, serve, and reconnect with capped
 /// exponential backoff. Never returns under normal operation.
 pub async fn run(creds: Credentials, capabilities: Vec<String>) {
@@ -85,7 +90,16 @@ async fn serve(
 
     // A single writer task owns the sink; the read loop + heartbeat push frames
     // through this channel so there's exactly one writer (no split-sink races).
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    //
+    // The channel is BOUNDED: query responses can carry up to MAX_ROWS
+    // (100k) rows each, so an unbounded queue in front of a slow/stalled
+    // socket would grow without limit. Every producer (hello, heartbeat,
+    // pong, spawned query handlers) runs in an async context, so
+    // `send().await` gives natural backpressure: a query handler simply
+    // parks until the writer drains, holding at most its own one response.
+    // A stalled heartbeat is fine — if the socket is that backed up the
+    // connection is already dying and the reconnect loop will recycle it.
+    let (tx, mut rx) = mpsc::channel::<Message>(WRITER_QUEUE);
 
     // 1) hello (authenticates + binds the stream to this tenant/agent).
     let hello = serde_json::json!({
@@ -96,7 +110,7 @@ async fn serve(
         "capabilities": capabilities,
         "agent_version": env!("CARGO_PKG_VERSION"),
     });
-    let _ = tx.send(Message::Text(hello.to_string()));
+    let _ = tx.send(Message::Text(hello.to_string())).await;
 
     let writer = tokio::spawn(async move {
         while let Some(m) = rx.recv().await {
@@ -113,7 +127,7 @@ async fn serve(
         loop {
             tokio::time::sleep(Duration::from_secs(30)).await;
             let m = serde_json::json!({ "kind": "heartbeat", "agent_id": hb_id });
-            if hb_tx.send(Message::Text(m.to_string())).is_err() {
+            if hb_tx.send(Message::Text(m.to_string())).await.is_err() {
                 break;
             }
         }
@@ -128,11 +142,7 @@ async fn serve(
     result
 }
 
-async fn read_loop<S>(
-    read: &mut S,
-    tx: &mpsc::UnboundedSender<Message>,
-    store: &Store,
-) -> Result<()>
+async fn read_loop<S>(read: &mut S, tx: &mpsc::Sender<Message>, store: &Store) -> Result<()>
 where
     S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
@@ -194,7 +204,9 @@ where
                 }
             }
             Message::Ping(p) => {
-                let _ = tx.send(Message::Pong(p));
+                // Bounded send: if the writer queue is full the read loop
+                // pauses here — backpressure on a stalled socket, by design.
+                let _ = tx.send(Message::Pong(p)).await;
             }
             Message::Close(_) => break,
             _ => {}
@@ -206,7 +218,7 @@ where
 /// Per-op row cap the agent enforces locally (matches the cloud default).
 const MAX_ROWS: usize = 100_000;
 
-async fn handle_query(req: Value, store: Store, tx: mpsc::UnboundedSender<Message>) {
+async fn handle_query(req: Value, store: Store, tx: mpsc::Sender<Message>) {
     let request_id = req
         .get("request_id")
         .and_then(Value::as_str)
@@ -237,7 +249,8 @@ async fn handle_query(req: Value, store: Store, tx: mpsc::UnboundedSender<Messag
             &request_id,
             "agent_unknown_datasource",
             &format!("agent has no config for datasource {ds_id}"),
-        );
+        )
+        .await;
         return;
     };
 
@@ -256,18 +269,18 @@ async fn handle_query(req: Value, store: Store, tx: mpsc::UnboundedSender<Messag
                 "ok": true,
                 "result": result,
             });
-            let _ = tx.send(Message::Text(resp.to_string()));
+            let _ = tx.send(Message::Text(resp.to_string())).await;
         }
-        Err(e) => respond_err(&tx, &request_id, "agent_query_failed", &e.to_string()),
+        Err(e) => respond_err(&tx, &request_id, "agent_query_failed", &e.to_string()).await,
     }
 }
 
-fn respond_err(tx: &mpsc::UnboundedSender<Message>, request_id: &str, code: &str, detail: &str) {
+async fn respond_err(tx: &mpsc::Sender<Message>, request_id: &str, code: &str, detail: &str) {
     let resp = serde_json::json!({
         "kind": "query_response",
         "request_id": request_id,
         "ok": false,
         "error": { "code": code, "detail": detail },
     });
-    let _ = tx.send(Message::Text(resp.to_string()));
+    let _ = tx.send(Message::Text(resp.to_string())).await;
 }

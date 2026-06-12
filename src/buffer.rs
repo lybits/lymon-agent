@@ -24,12 +24,21 @@
 // On agent restart, any rows with batch_id != NULL are recovered as
 // in-flight batches and retried; idempotency on the server side
 // (ingested_batches table) ensures no duplicates.
+//
+// Capacity: the table is capped at `max_rows` (high-water mark). When an
+// enqueue would push past it, the OLDEST rows still in PENDING state are
+// dropped in chunks (drop-oldest) — losing the oldest history is better than
+// filling the device disk, which would make every enqueue fail and can
+// corrupt the WAL. In-flight rows are never dropped: the streamer already
+// claimed them and will DELETE/UNCLAIM them itself; touching them would
+// desync the in_flight_batches bookkeeping.
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OpenFlags};
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::debug;
+use tracing::{debug, warn};
 use ulid::Ulid;
 
 use crate::generated::lymon::ingest::v1::Sample;
@@ -40,12 +49,30 @@ pub struct ClaimedBatch {
     pub samples: Vec<Sample>,
 }
 
+/// Default high-water mark for `pending_samples`.
+///
+/// Measured on the real schema (table + both indexes, Modbus-style rows with
+/// no attrs): ~68 bytes/row on disk. 5M rows ≈ 340 MB of data file, which
+/// leaves comfortable headroom on the 1Gi helm PV for the WAL (can transiently
+/// approach the data size before checkpoint), free-page fragmentation and
+/// credentials.json — well under the ~512 MB budget. At the default capture
+/// rate (100 registers @ 100ms = 1000 samples/s) that is ~83 minutes of
+/// offline buffering; at 1 sample/s per register it is several days.
+pub const DEFAULT_MAX_ROWS: u64 = 5_000_000;
+
 pub struct BufferDb {
     conn: Arc<Mutex<Connection>>,
+    /// High-water mark: max rows allowed in pending_samples.
+    max_rows: u64,
+    /// Total samples dropped by the drop-oldest policy since startup.
+    dropped_total: Arc<AtomicU64>,
+    /// Last time we emitted the "dropping samples" warn, in unix ms.
+    /// Throttles logging so a sustained overflow doesn't log per enqueue.
+    last_drop_log_ms: Arc<AtomicI64>,
 }
 
 impl BufferDb {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open(path: impl AsRef<Path>, max_rows: u64) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -93,19 +120,82 @@ impl BufferDb {
 
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
+            max_rows,
+            dropped_total: Arc::new(AtomicU64::new(0)),
+            last_drop_log_ms: Arc::new(AtomicI64::new(0)),
         })
     }
 
-    /// Append samples to the buffer.
+    /// Total samples dropped by the drop-oldest policy since startup.
+    pub fn dropped_total(&self) -> u64 {
+        self.dropped_total.load(Ordering::Relaxed)
+    }
+
+    /// Append samples to the buffer, enforcing the high-water mark.
+    ///
+    /// If the insert would push the table past `max_rows`, the oldest PENDING
+    /// rows are deleted first (drop-oldest) in chunks of ~1% of the limit, so
+    /// a sustained overflow amortizes the deletes instead of trimming one row
+    /// per insert. In-flight rows are never touched.
     #[tracing::instrument(skip(self, samples), fields(sample_count = samples.len()))]
     pub async fn enqueue(&self, samples: Vec<Sample>) -> Result<()> {
         if samples.is_empty() {
             return Ok(());
         }
         let conn = self.conn.clone();
+        let max_rows = self.max_rows;
+        let dropped_total = self.dropped_total.clone();
+        let last_drop_log_ms = self.last_drop_log_ms.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut conn = conn.lock().expect("buffer lock poisoned");
             let tx = conn.transaction()?;
+
+            // Drop-oldest inside the same transaction as the insert so the
+            // cap holds atomically even if the agent crashes mid-enqueue.
+            let total: i64 =
+                tx.query_row("SELECT count(*) FROM pending_samples", [], |row| row.get(0))?;
+            let projected = total as u64 + samples.len() as u64;
+            if projected > max_rows {
+                // Trim at least the overshoot, rounded up to a ~1% chunk so a
+                // steady overflow deletes in batches, not row-by-row.
+                let overshoot = projected - max_rows;
+                let chunk = (max_rows / 100).max(1);
+                let to_drop = overshoot.max(chunk);
+                let dropped = tx.execute(
+                    "DELETE FROM pending_samples WHERE id IN ( \
+                         SELECT id FROM pending_samples \
+                         WHERE batch_id IS NULL \
+                         ORDER BY id LIMIT ?1)",
+                    [to_drop as i64],
+                )? as u64;
+                // If everything left is in-flight there may be nothing to
+                // drop; we still insert (in-flight is bounded by the
+                // streamer's batch size, so this overshoot stays small).
+                if dropped > 0 {
+                    let total_dropped =
+                        dropped_total.fetch_add(dropped, Ordering::Relaxed) + dropped;
+                    // Warn at most every 30s: at 10 polls/s an unthrottled
+                    // warn would flood the (possibly remote) log sink.
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    let last = last_drop_log_ms.load(Ordering::Relaxed);
+                    if now_ms - last >= 30_000
+                        && last_drop_log_ms
+                            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        warn!(
+                            dropped,
+                            total_dropped,
+                            max_rows,
+                            "buffer over high-water mark; dropped oldest pending samples"
+                        );
+                    }
+                }
+            }
+
             {
                 let mut stmt = tx.prepare_cached(
                     "INSERT INTO pending_samples \
@@ -323,7 +413,7 @@ mod tests {
     #[tokio::test]
     async fn enqueue_claim_ack_roundtrip() {
         let dir = tempdir().unwrap();
-        let buffer = BufferDb::open(dir.path().join("buf.db")).unwrap();
+        let buffer = BufferDb::open(dir.path().join("buf.db"), DEFAULT_MAX_ROWS).unwrap();
 
         buffer
             .enqueue(vec![sample("v1", 100, 1.0), sample("v2", 200, 2.0)])
@@ -349,7 +439,7 @@ mod tests {
     #[tokio::test]
     async fn ack_retry_returns_samples_to_pending() {
         let dir = tempdir().unwrap();
-        let buffer = BufferDb::open(dir.path().join("buf.db")).unwrap();
+        let buffer = BufferDb::open(dir.path().join("buf.db"), DEFAULT_MAX_ROWS).unwrap();
 
         buffer.enqueue(vec![sample("v1", 100, 1.0)]).await.unwrap();
         let claimed = buffer.claim_batch(10).await.unwrap().unwrap();
@@ -368,7 +458,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("buf.db");
 
-        let buffer = BufferDb::open(&db_path).unwrap();
+        let buffer = BufferDb::open(&db_path, DEFAULT_MAX_ROWS).unwrap();
         buffer
             .enqueue(vec![sample("v1", 100, 1.0), sample("v2", 200, 2.0)])
             .await
@@ -379,7 +469,7 @@ mod tests {
         drop(buffer);
 
         // Re-open
-        let buffer = BufferDb::open(&db_path).unwrap();
+        let buffer = BufferDb::open(&db_path, DEFAULT_MAX_ROWS).unwrap();
         let recovered = buffer.recover_in_flight().await.unwrap();
         assert_eq!(recovered.len(), 1);
         assert_eq!(recovered[0].batch_id, original_batch_id);
@@ -393,7 +483,91 @@ mod tests {
     #[tokio::test]
     async fn claim_returns_none_when_empty() {
         let dir = tempdir().unwrap();
-        let buffer = BufferDb::open(dir.path().join("buf.db")).unwrap();
+        let buffer = BufferDb::open(dir.path().join("buf.db"), DEFAULT_MAX_ROWS).unwrap();
         assert!(buffer.claim_batch(10).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn enqueue_over_high_water_drops_oldest_pending() {
+        let dir = tempdir().unwrap();
+        let buffer = BufferDb::open(dir.path().join("buf.db"), 10).unwrap();
+
+        // Fill exactly to the high-water mark.
+        let first: Vec<Sample> = (0..10).map(|i| sample("v", i as i64, i as f64)).collect();
+        buffer.enqueue(first).await.unwrap();
+        assert_eq!(buffer.counts().await.unwrap(), (10, 0));
+        assert_eq!(buffer.dropped_total(), 0);
+
+        // One more sample → the single oldest pending row must go.
+        buffer.enqueue(vec![sample("v", 100, 100.0)]).await.unwrap();
+        let (pending, in_flight) = buffer.counts().await.unwrap();
+        assert_eq!((pending, in_flight), (10, 0));
+        assert_eq!(buffer.dropped_total(), 1);
+
+        // Oldest survivor is ts=1 (ts=0 was dropped) and the newest is the
+        // sample that triggered the trim.
+        let claimed = buffer.claim_batch(100).await.unwrap().unwrap();
+        assert_eq!(claimed.samples.first().unwrap().ts_ms, 1);
+        assert_eq!(claimed.samples.last().unwrap().ts_ms, 100);
+    }
+
+    #[tokio::test]
+    async fn drop_oldest_never_touches_in_flight_rows() {
+        let dir = tempdir().unwrap();
+        let buffer = BufferDb::open(dir.path().join("buf.db"), 5).unwrap();
+
+        // 3 rows claimed in-flight + 2 pending = at the cap.
+        buffer
+            .enqueue((0..3).map(|i| sample("inflight", i as i64, 0.0)).collect())
+            .await
+            .unwrap();
+        let claimed = buffer.claim_batch(3).await.unwrap().unwrap();
+        buffer
+            .enqueue((10..12).map(|i| sample("pend", i as i64, 0.0)).collect())
+            .await
+            .unwrap();
+        assert_eq!(buffer.counts().await.unwrap(), (2, 3));
+
+        // 2 more → must evict 2 pending rows, never the in-flight ones.
+        buffer
+            .enqueue((20..22).map(|i| sample("new", i as i64, 0.0)).collect())
+            .await
+            .unwrap();
+        let (pending, in_flight) = buffer.counts().await.unwrap();
+        assert_eq!(in_flight, 3, "in-flight rows must survive the trim");
+        assert_eq!(pending, 2);
+        assert_eq!(buffer.dropped_total(), 2);
+
+        // The in-flight batch is still intact and ACKable.
+        buffer.ack_ok(claimed.batch_id).await.unwrap();
+        assert_eq!(buffer.counts().await.unwrap(), (2, 0));
+
+        // Survivors are the newest enqueued rows.
+        let survivors = buffer.claim_batch(100).await.unwrap().unwrap();
+        let vars: Vec<_> = survivors
+            .samples
+            .iter()
+            .map(|s| s.variable_id.as_str())
+            .collect();
+        assert_eq!(vars, vec!["new", "new"]);
+    }
+
+    #[tokio::test]
+    async fn drop_oldest_when_all_rows_in_flight_still_inserts() {
+        let dir = tempdir().unwrap();
+        let buffer = BufferDb::open(dir.path().join("buf.db"), 2).unwrap();
+
+        buffer
+            .enqueue(vec![sample("v1", 1, 1.0), sample("v2", 2, 2.0)])
+            .await
+            .unwrap();
+        buffer.claim_batch(10).await.unwrap().unwrap();
+        assert_eq!(buffer.counts().await.unwrap(), (0, 2));
+
+        // Cap reached with only in-flight rows: nothing droppable, but the
+        // insert must still succeed (bounded overshoot, no data loss).
+        buffer.enqueue(vec![sample("v3", 3, 3.0)]).await.unwrap();
+        assert_eq!(buffer.counts().await.unwrap(), (1, 2));
+        assert_eq!(buffer.dropped_total(), 0);
     }
 }
