@@ -240,12 +240,7 @@ impl BufferDb {
                         Some(serde_json::to_string(&s.attrs)?)
                     };
                     stmt.execute(params![
-                        s.point_id,
-                        s.ts_ms,
-                        s.value,
-                        s.quality,
-                        attrs_json,
-                        origin,
+                        s.point_id, s.ts_ms, s.value, s.quality, attrs_json, origin,
                     ])?;
                 }
             }
