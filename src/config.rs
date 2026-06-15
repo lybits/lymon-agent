@@ -8,10 +8,8 @@ use std::time::Duration;
 pub struct Config {
     /// Which local source this agent reports (still configured locally).
     pub datasource_id: String,
-    pub modbus_host: String,
-    pub modbus_port: u16,
+    /// Default poll cadence for collectors that don't override it.
     pub poll_interval_ms: u64,
-    pub register_count: u16,
     // Location of the SQLite WAL buffer; agent credentials are stored
     // alongside it (credentials.json) after enrollment.
     pub buffer_path: String,
@@ -48,10 +46,7 @@ impl Config {
     pub fn load(_file_path: Option<&str>) -> Result<Self> {
         Ok(Config {
             datasource_id: env_required("LYMON_DATASOURCE_ID")?,
-            modbus_host: env_required("LYMON_MODBUS_HOST")?,
-            modbus_port: env_required("LYMON_MODBUS_PORT")?.parse()?,
             poll_interval_ms: env_optional("LYMON_POLL_INTERVAL_MS", "100").parse()?,
-            register_count: env_optional("LYMON_REGISTER_COUNT", "100").parse()?,
             buffer_path: env_optional("LYMON_BUFFER_PATH", "/var/lib/lymon-agent/buffer.db"),
             buffer_max_rows: env_optional(
                 "LYMON_BUFFER_MAX_ROWS",

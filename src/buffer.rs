@@ -147,9 +147,11 @@ impl BufferDb {
         self.dropped_total.load(Ordering::Relaxed)
     }
 
-    /// Append samples to the buffer under the agent's default origin (legacy
-    /// Modbus path). Equivalent to `enqueue_with_origin(None, …)`. The
-    /// high-water mark / drop-oldest cap is enforced by `enqueue_with_origin`.
+    /// Append samples under the agent's default origin. Convenience wrapper over
+    /// `enqueue_with_origin(None, …)`; used by tests (the legacy standalone
+    /// Modbus poller that used it in prod was removed — collection now always
+    /// carries a connector origin via the Phase-2 collector).
+    #[cfg(test)]
     pub async fn enqueue(&self, samples: Vec<Sample>) -> Result<()> {
         self.enqueue_with_origin(None, samples).await
     }

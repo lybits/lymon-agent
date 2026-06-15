@@ -326,7 +326,6 @@ async fn collect_once(
                 *modbus = Some(ModbusClient::new(
                     host.to_string(),
                     port,
-                    count,
                     poll_interval,
                 ));
             }
