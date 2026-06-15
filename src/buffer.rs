@@ -240,7 +240,7 @@ impl BufferDb {
                         Some(serde_json::to_string(&s.attrs)?)
                     };
                     stmt.execute(params![
-                        s.variable_id,
+                        s.point_id,
                         s.ts_ms,
                         s.value,
                         s.quality,
@@ -448,7 +448,7 @@ fn load_samples_for_batch(
             None => std::collections::HashMap::new(),
         };
         Ok(Sample {
-            variable_id: row.get(0)?,
+            point_id: row.get(0)?,
             ts_ms: row.get(1)?,
             value: row.get(2)?,
             quality: row.get::<_, i64>(3)? as u32,
@@ -466,7 +466,7 @@ mod tests {
 
     fn sample(var: &str, ts: i64, val: f64) -> Sample {
         Sample {
-            variable_id: var.to_string(),
+            point_id: var.to_string(),
             ts_ms: ts,
             value: val,
             quality: 0,
@@ -489,7 +489,7 @@ mod tests {
 
         let claimed = buffer.claim_batch(10).await.unwrap().expect("has batch");
         assert_eq!(claimed.samples.len(), 2);
-        assert_eq!(claimed.samples[0].variable_id, "v1");
+        assert_eq!(claimed.samples[0].point_id, "v1");
 
         let (pending, in_flight) = buffer.counts().await.unwrap();
         assert_eq!((pending, in_flight), (0, 2));
@@ -528,7 +528,7 @@ mod tests {
         let first = buffer.claim_batch(10).await.unwrap().expect("batch");
         assert_eq!(first.origin.as_deref(), Some("con_a"));
         assert_eq!(first.samples.len(), 2);
-        assert!(first.samples.iter().all(|s| s.variable_id.starts_with('a')));
+        assert!(first.samples.iter().all(|s| s.point_id.starts_with('a')));
         buffer.ack_ok(first.batch_id).await.unwrap();
 
         // Next is con_b.
@@ -540,7 +540,7 @@ mod tests {
         // Finally the legacy (None) origin.
         let third = buffer.claim_batch(10).await.unwrap().expect("batch");
         assert_eq!(third.origin, None);
-        assert_eq!(third.samples[0].variable_id, "legacy");
+        assert_eq!(third.samples[0].point_id, "legacy");
     }
 
     #[tokio::test]
@@ -654,7 +654,7 @@ mod tests {
         let vars: Vec<_> = survivors
             .samples
             .iter()
-            .map(|s| s.variable_id.as_str())
+            .map(|s| s.point_id.as_str())
             .collect();
         assert_eq!(vars, vec!["new", "new"]);
     }

@@ -153,7 +153,7 @@ impl ModbusClient {
             .iter()
             .enumerate()
             .map(|(idx, &raw)| Sample {
-                variable_id: format!("holding_register/{idx}"),
+                point_id: format!("holding_register/{idx}"),
                 ts_ms,
                 value: raw as f64,
                 quality: 0,

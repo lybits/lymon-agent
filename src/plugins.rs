@@ -109,7 +109,7 @@ impl Plugin {
             .samples
             .into_iter()
             .map(|s| Sample {
-                variable_id: s.variable_id,
+                point_id: s.variable_id,
                 ts_ms: s.ts_ms.unwrap_or(now),
                 value: s.value,
                 quality: s.quality.unwrap_or(0),
@@ -261,7 +261,7 @@ impl PluginStream {
                 resp.samples
                     .into_iter()
                     .map(|s| Sample {
-                        variable_id: s.variable_id,
+                        point_id: s.variable_id,
                         ts_ms: s.ts_ms.unwrap_or(now),
                         value: s.value,
                         quality: s.quality.unwrap_or(0),
@@ -393,7 +393,7 @@ mod tests {
         };
         let samples = plugin.read(&conn, &ing).await.unwrap();
         assert_eq!(samples.len(), 1);
-        assert_eq!(samples[0].variable_id, "plug.v");
+        assert_eq!(samples[0].point_id, "plug.v");
         assert_eq!(samples[0].value, 42.0);
     }
 

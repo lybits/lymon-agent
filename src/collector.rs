@@ -240,7 +240,7 @@ async fn run_window(
         match collect_once(conn, ing, modbus, plugins).await {
             Ok(samples) => {
                 for s in samples {
-                    let e = acc.entry(s.variable_id).or_insert((0.0, 0));
+                    let e = acc.entry(s.point_id).or_insert((0.0, 0));
                     e.0 += s.value;
                     e.1 += 1;
                 }
@@ -260,7 +260,7 @@ async fn run_window(
     let out: Vec<Sample> = acc
         .into_iter()
         .map(|(variable_id, (sum, count))| Sample {
-            variable_id,
+            point_id: variable_id,
             ts_ms,
             value: if count > 0 {
                 sum / f64::from(count)
@@ -336,7 +336,7 @@ async fn collect_once(
                 .iter()
                 .enumerate()
                 .map(|(i, &raw)| Sample {
-                    variable_id: if n == 1 {
+                    point_id: if n == 1 {
                         var_id.clone()
                     } else {
                         format!("{var_id}/{i}")
@@ -361,7 +361,7 @@ async fn collect_once(
             let value = scalar_value(&result)
                 .with_context(|| format!("pss query for {var_id} returned no scalar value"))?;
             Ok(vec![Sample {
-                variable_id: var_id,
+                point_id: var_id,
                 ts_ms,
                 value: apply_scale(value, &ing.transform),
                 quality: 0,
