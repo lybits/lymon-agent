@@ -323,12 +323,7 @@ async fn collect_once(
                 // gives the collector's Modbus reads the same half-open-PLC
                 // timeout protection as the legacy default-datasource poller.
                 let poll_interval = Duration::from_secs(ing.interval_s.max(1));
-                *modbus = Some(ModbusClient::new(
-                    host.to_string(),
-                    port,
-                    count,
-                    poll_interval,
-                ));
+                *modbus = Some(ModbusClient::new(host.to_string(), port, poll_interval));
             }
             let regs = modbus.as_mut().unwrap().read(start, count, input).await?;
             let n = regs.len();

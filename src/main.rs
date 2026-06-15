@@ -40,7 +40,6 @@ pub mod generated {
 
 use crate::buffer::BufferDb;
 use crate::ingest_client::BufferStreamer;
-use crate::modbus::ModbusClient;
 
 #[derive(Parser, Debug)]
 #[command(version, about = "Lymon Edge Agent")]
@@ -74,9 +73,6 @@ async fn main() -> Result<()> {
         agent_id = %creds.agent_id,
         datasource_id = %cfg.datasource_id,
         ingest_endpoint = %creds.ingest_endpoint,
-        modbus = format!("{}:{}", cfg.modbus_host, cfg.modbus_port),
-        poll_ms = cfg.poll_interval_ms,
-        registers = cfg.register_count,
         buffer_path = %cfg.buffer_path,
         buffer_max_rows = cfg.buffer_max_rows,
         "lymon-agent starting (Día 3 — durable SQLite WAL buffer)"
@@ -94,46 +90,9 @@ async fn main() -> Result<()> {
     let (pending, in_flight) = buffer.counts().await?;
     info!(pending, in_flight, "buffer opened");
 
-    // Spawn the Modbus reader. It pushes samples into the durable buffer.
-    let modbus_handle = {
-        let buffer = buffer.clone();
-        let interval = Duration::from_millis(cfg.poll_interval_ms);
-        let mut modbus = ModbusClient::new(
-            cfg.modbus_host.clone(),
-            cfg.modbus_port,
-            cfg.register_count,
-            interval,
-        );
-
-        tokio::spawn(async move {
-            // Retry with exponential backoff so a dead PLC isn't hammered
-            // every second; reset after the first successful poll (same
-            // pattern as the ingest streamer's reconnect backoff).
-            let mut backoff_secs: u64 = 1;
-            let max_backoff: u64 = 30;
-            loop {
-                match modbus.poll().await {
-                    Ok(samples) => {
-                        backoff_secs = 1;
-                        if let Err(e) = buffer.enqueue(samples).await {
-                            error!(error = %e, "failed to enqueue samples to buffer");
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            error = %e,
-                            backoff_secs,
-                            "Modbus poll failed; will retry"
-                        );
-                        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = (backoff_secs * 2).min(max_backoff);
-                        continue;
-                    }
-                }
-                tokio::time::sleep(interval).await;
-            }
-        })
-    };
+    // NOTE: the standalone Modbus poller (Spike A "Día 3") was removed — Modbus
+    // is now collected only when an operator provisions a Modbus connector/ingest,
+    // via the Phase-2 collector below (no more unconditional CHANGE_ME:502 polling).
 
     // Agent-as-gateway control channel. Opens only when the agent enrolled
     // with a tenant + control endpoint (modern enrollment); legacy/env creds
@@ -182,7 +141,6 @@ async fn main() -> Result<()> {
 
     let result = streamer.run().await;
 
-    modbus_handle.abort();
     if let Some(h) = control_handle {
         h.abort();
     }
