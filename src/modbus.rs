@@ -96,5 +96,4 @@ impl ModbusClient {
             }
         }
     }
-
 }
