@@ -238,6 +238,25 @@ where
                             handle_query(v, store, connectors, plugins, tx).await
                         });
                     }
+                    Some("update") => {
+                        // Cloud-triggered self-update (phase 2). We DON'T touch
+                        // our own binary (we can't — DynamicUser, and we're
+                        // running): we drop a trigger file and let the
+                        // privileged OS updater (systemd path-unit on Linux, a
+                        // watcher task on Windows) download the bundle, swap the
+                        // binary + plugins, and restart us.
+                        let version = v.get("version").and_then(Value::as_str).unwrap_or("");
+                        let repo = v.get("repo").and_then(Value::as_str);
+                        match request_update(version, repo) {
+                            Ok(path) => info!(
+                                version,
+                                repo = repo.unwrap_or("(default)"),
+                                path = %path.display(),
+                                "self-update requested by cloud; wrote update trigger"
+                            ),
+                            Err(e) => warn!(error = %e, "ignoring invalid self-update request"),
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -251,6 +270,51 @@ where
         }
     }
     Ok(())
+}
+
+/// Validate + persist a self-update request as a trigger file the privileged
+/// updater consumes. We deliberately do NOT act on it here: the updater (root)
+/// owns the bundle swap + restart. The file lives next to the buffer (same dir
+/// as credentials.json), resolved from LYMON_BUFFER_PATH.
+///
+/// `version`/`repo` come off the wire, so they're strictly validated — they end
+/// up in a download URL the updater builds. version: optional leading `v` then
+/// [0-9A-Za-z._-]. repo: `owner/name` with the same safe alphabet.
+fn request_update(version: &str, repo: Option<&str>) -> Result<std::path::PathBuf> {
+    let safe_tag = |s: &str| {
+        let body = s.strip_prefix('v').unwrap_or(s);
+        !body.is_empty()
+            && body.len() <= 64
+            && body
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+    };
+    if !safe_tag(version) {
+        anyhow::bail!("invalid version {version:?}");
+    }
+    if let Some(r) = repo {
+        let ok = r.len() <= 140
+            && r.matches('/').count() == 1
+            && r.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'/'));
+        if !ok {
+            anyhow::bail!("invalid repo {r:?}");
+        }
+    }
+
+    let buffer_path = std::env::var("LYMON_BUFFER_PATH")
+        .unwrap_or_else(|_| "/var/lib/lymon-agent/buffer.db".to_string());
+    let dir = std::path::Path::new(&buffer_path)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let path = dir.join("update-request.json");
+    let payload = match repo {
+        Some(r) => serde_json::json!({ "version": version, "repo": r }),
+        None => serde_json::json!({ "version": version }),
+    };
+    std::fs::write(&path, serde_json::to_vec(&payload)?).context("writing update-request.json")?;
+    Ok(path)
 }
 
 /// Per-op row cap the agent enforces locally (matches the cloud default).
