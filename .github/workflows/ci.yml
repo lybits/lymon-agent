@@ -56,9 +56,11 @@ jobs:
         with:
           components: clippy
 
+      # Root is a package (the agent), so a bare build skips member binaries.
+      # Build the agent + the s7 plugin so both are gated in CI.
       - name: Cargo build
         working-directory: ./lymon-agent
-        run: cargo build --release
+        run: cargo build --release -p lymon-agent -p lymon-plugin-s7
 
       - name: Cargo test
         working-directory: ./lymon-agent

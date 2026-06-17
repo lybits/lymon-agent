@@ -60,10 +60,12 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      # Agent + the s7 plugin (a workspace member) build together.
-      - name: Build agent + workspace plugins
+      # The workspace root IS a package (the agent), so a bare `cargo build`
+      # builds ONLY the agent — NOT the member binaries. List the s7 plugin
+      # explicitly so its binary lands in the target dir for the bundle.
+      - name: Build agent + s7 plugin
         working-directory: ./lymon-agent
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p lymon-agent -p lymon-plugin-s7
 
       # The OPC-UA plugin is kept out of the workspace (own Cargo.lock, heavy
       # deps), so it needs its own build — but it's first-party and ships in
