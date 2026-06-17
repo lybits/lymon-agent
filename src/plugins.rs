@@ -324,7 +324,11 @@ impl PluginHost {
             // plugin's dir (see the Plugin.exec doc — required for Windows).
             let exec_abs = {
                 let e = std::path::Path::new(&m.exec);
-                if e.is_absolute() { e.to_path_buf() } else { pdir.join(e) }
+                if e.is_absolute() {
+                    e.to_path_buf()
+                } else {
+                    pdir.join(e)
+                }
             };
             let plugin = Arc::new(Plugin {
                 name: m.name.clone(),
