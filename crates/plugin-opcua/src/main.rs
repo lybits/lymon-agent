@@ -54,34 +54,52 @@ impl OpcUaConnector {
     }
 
     /// Connect to `endpoint` and spawn the event loop on the runtime.
+    ///
+    /// Bounded by CONNECT_TIMEOUT: `wait_for_connection()` (and the endpoint
+    /// discovery before it) have no timeout of their own, so a server that's
+    /// unreachable, or that exposes no SecurityPolicy=None endpoint, would
+    /// leave the session-retry loop spinning forever — the poll would hang
+    /// silently with no log line. Timing out turns that into a clear error.
     async fn connect(endpoint: &str, identity: IdentityToken) -> Result<Arc<Session>, String> {
-        let mut client: Client = ClientBuilder::new()
-            .application_name("Lymon Agent")
-            .application_uri("urn:lymon:agent")
-            .product_uri("urn:lymon:agent")
-            .trust_server_certs(true)
-            .create_sample_keypair(true)
-            .session_retry_limit(3)
-            .client()
-            .map_err(|e| format!("failed to build OPC-UA client: {e:?}"))?;
+        let work = async {
+            let mut client: Client = ClientBuilder::new()
+                .application_name("Lymon Agent")
+                .application_uri("urn:lymon:agent")
+                .product_uri("urn:lymon:agent")
+                .trust_server_certs(true)
+                .create_sample_keypair(true)
+                .session_retry_limit(3)
+                .client()
+                .map_err(|e| format!("failed to build OPC-UA client: {e:?}"))?;
 
-        let (session, event_loop) = client
-            .connect_to_matching_endpoint(
-                (
-                    endpoint,
-                    SecurityPolicy_None,
-                    MessageSecurityMode::None,
-                    UserTokenPolicy::anonymous(),
-                ),
-                identity,
-            )
-            .await
-            .map_err(|e| format!("connect {endpoint}: {e}"))?;
+            let (session, event_loop) = client
+                .connect_to_matching_endpoint(
+                    (
+                        endpoint,
+                        SecurityPolicy_None,
+                        MessageSecurityMode::None,
+                        UserTokenPolicy::anonymous(),
+                    ),
+                    identity,
+                )
+                .await
+                .map_err(|e| format!("connect {endpoint}: {e}"))?;
 
-        // Drive the event loop in the background so the session stays alive.
-        let _handle = event_loop.spawn();
-        session.wait_for_connection().await;
-        Ok(session)
+            // Drive the event loop in the background so the session stays alive.
+            let _handle = event_loop.spawn();
+            session.wait_for_connection().await;
+            Ok::<Arc<Session>, String>(session)
+        };
+
+        match tokio::time::timeout(CONNECT_TIMEOUT, work).await {
+            Ok(r) => r,
+            Err(_) => Err(format!(
+                "connect {endpoint}: timed out after {}s — server unreachable from the agent, \
+                 or it exposes no SecurityPolicy=None + Anonymous endpoint (the only mode this \
+                 plugin speaks today)",
+                CONNECT_TIMEOUT.as_secs()
+            )),
+        }
     }
 
     /// Get a live session for `endpoint`, (re)connecting if we have none or it's
@@ -129,6 +147,11 @@ fn identity_from(req: &ReadRequest) -> IdentityToken {
 /// SecurityPolicy::None as the wire string the endpoint tuple expects.
 #[allow(non_upper_case_globals)]
 const SecurityPolicy_None: &str = "http://opcfoundation.org/UA/SecurityPolicy#None";
+
+/// Upper bound for establishing a session before we give up and report an
+/// error (instead of the poll hanging silently). Generous enough for a slow
+/// PLC handshake, short enough that a misconfig surfaces within one poll.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 impl Collector for OpcUaConnector {
     fn read(&mut self, req: &ReadRequest) -> Result<Vec<Sample>, String> {
