@@ -320,11 +320,14 @@ impl PluginHost {
                 warn!(plugin = %m.name, protocol = m.protocol, "unsupported plugin protocol; skipped");
                 continue;
             }
-            // Resolve the manifest `exec` to an absolute path against the
-            // plugin's dir (see the Plugin.exec doc — required for Windows).
+            // Resolve the manifest `exec` (see the Plugin.exec doc — required
+            // for Windows). A RELATIVE PATH (carries a separator, e.g.
+            // `./lymon-plugin-opcua.exe`) is resolved against the plugin's own
+            // dir. A bare command NAME (e.g. `sh`, `python`) is left untouched
+            // so the OS resolves it on PATH.
             let exec_abs = {
                 let e = std::path::Path::new(&m.exec);
-                if e.is_absolute() {
+                if e.is_absolute() || !(m.exec.contains('/') || m.exec.contains('\\')) {
                     e.to_path_buf()
                 } else {
                     pdir.join(e)
