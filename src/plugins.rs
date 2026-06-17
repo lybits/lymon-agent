@@ -82,7 +82,12 @@ struct Proc {
 pub struct Plugin {
     name: String,
     dir: PathBuf,
-    exec: String,
+    // Absolute path to the plugin binary. MUST be absolute: on Windows
+    // CreateProcess resolves a relative program path against the PARENT's cwd
+    // (the agent), not the `current_dir` we set for the child — so a manifest
+    // `exec: ./lymon-plugin-opcua.exe` would fail to launch. We resolve it
+    // against the plugin's own dir at discovery time.
+    exec: PathBuf,
     args: Vec<String>,
     proc: Mutex<Option<Proc>>,
 }
@@ -315,10 +320,16 @@ impl PluginHost {
                 warn!(plugin = %m.name, protocol = m.protocol, "unsupported plugin protocol; skipped");
                 continue;
             }
+            // Resolve the manifest `exec` to an absolute path against the
+            // plugin's dir (see the Plugin.exec doc — required for Windows).
+            let exec_abs = {
+                let e = std::path::Path::new(&m.exec);
+                if e.is_absolute() { e.to_path_buf() } else { pdir.join(e) }
+            };
             let plugin = Arc::new(Plugin {
                 name: m.name.clone(),
                 dir: pdir,
-                exec: m.exec,
+                exec: exec_abs,
                 args: m.args,
                 proc: Mutex::new(None),
             });
