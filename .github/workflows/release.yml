@@ -82,37 +82,42 @@ jobs:
           set -euo pipefail
           EXT="${{ matrix.ext }}"
           TARGET="${{ matrix.target }}"
-          REL="target/$TARGET/release"
+          # Agent + s7 are workspace members → root target dir. The OPC-UA plugin
+          # is EXCLUDED from the workspace (own Cargo.lock), so cargo writes it
+          # under its OWN crate target dir, not the root one.
+          ROOT="target/$TARGET/release"
+          OPCUA="crates/plugin-opcua/target/$TARGET/release"
           BUNDLE="lymon-agent-${{ matrix.slug }}"
           mkdir -p dist
-          # Raw agent binary kept as a standalone asset (back-compat with the
-          # portal's existing "Add agent" install links).
-          cp "$REL/lymon-agent$EXT" "dist/lymon-agent-${{ matrix.slug }}$EXT"
-          # Drop-in bundle layout.
-          for p in lymon-plugin-opcua lymon-plugin-s7; do
-            mkdir -p "dist/$BUNDLE/plugins/$p"
-            cp "$REL/$p$EXT" "dist/$BUNDLE/plugins/$p/"
-          done
-          cp "$REL/lymon-agent$EXT" "dist/$BUNDLE/"
-          cp crates/plugin-opcua/plugin.json "dist/$BUNDLE/plugins/lymon-plugin-opcua/"
-          cp crates/plugin-s7/plugin.json    "dist/$BUNDLE/plugins/lymon-plugin-s7/"
+          # Raw agent binary kept as a standalone asset. On Linux/macOS its name
+          # ("lymon-agent-<slug>", no ext) collides with the bundle DIR of the
+          # same name, so the bundle is staged under dist/bundle/ instead.
+          cp "$ROOT/lymon-agent$EXT" "dist/lymon-agent-${{ matrix.slug }}$EXT"
+          # Drop-in bundle layout under dist/bundle/<BUNDLE>/.
+          B="dist/bundle/$BUNDLE"
+          mkdir -p "$B/plugins/lymon-plugin-opcua" "$B/plugins/lymon-plugin-s7"
+          cp "$ROOT/lymon-agent$EXT"         "$B/"
+          cp "$OPCUA/lymon-plugin-opcua$EXT" "$B/plugins/lymon-plugin-opcua/"
+          cp "$ROOT/lymon-plugin-s7$EXT"     "$B/plugins/lymon-plugin-s7/"
+          cp crates/plugin-opcua/plugin.json "$B/plugins/lymon-plugin-opcua/"
+          cp crates/plugin-s7/plugin.json    "$B/plugins/lymon-plugin-s7/"
           # On Windows the manifest exec must carry .exe to launch.
           if [ -n "$EXT" ]; then
-            sed -i 's#"\./lymon-plugin-opcua"#"./lymon-plugin-opcua.exe"#' "dist/$BUNDLE/plugins/lymon-plugin-opcua/plugin.json"
-            sed -i 's#"\./lymon-plugin-s7"#"./lymon-plugin-s7.exe"#'       "dist/$BUNDLE/plugins/lymon-plugin-s7/plugin.json"
+            sed -i 's#"\./lymon-plugin-opcua"#"./lymon-plugin-opcua.exe"#' "$B/plugins/lymon-plugin-opcua/plugin.json"
+            sed -i 's#"\./lymon-plugin-s7"#"./lymon-plugin-s7.exe"#'       "$B/plugins/lymon-plugin-s7/plugin.json"
           fi
 
       - name: Archive bundle (tar.gz)
         if: runner.os != 'Windows'
         shell: bash
         working-directory: ./lymon-agent
-        run: tar -czf "dist/lymon-agent-${{ matrix.slug }}.tar.gz" -C dist "lymon-agent-${{ matrix.slug }}"
+        run: tar -czf "dist/lymon-agent-${{ matrix.slug }}.tar.gz" -C dist/bundle "lymon-agent-${{ matrix.slug }}"
 
       - name: Archive bundle (zip)
         if: runner.os == 'Windows'
         shell: pwsh
         working-directory: ./lymon-agent
-        run: Compress-Archive -Path "dist/lymon-agent-${{ matrix.slug }}" -DestinationPath "dist/lymon-agent-${{ matrix.slug }}.zip"
+        run: Compress-Archive -Path "dist/bundle/lymon-agent-${{ matrix.slug }}" -DestinationPath "dist/lymon-agent-${{ matrix.slug }}.zip"
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
