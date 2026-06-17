@@ -69,6 +69,18 @@ jobs:
         working-directory: ./lymon-agent
         run: cargo clippy --release --all-targets -- -D warnings
 
+      # First-party plugins kept OUT of the workspace (own Cargo.lock, heavy
+      # deps) still ship with the agent — gate them in CI so they don't rot.
+      # The s7 plugin is a workspace member and is already covered above.
+      - name: Build OPC-UA plugin (excluded from workspace)
+        working-directory: ./lymon-agent
+        run: cargo build --release --manifest-path crates/plugin-opcua/Cargo.toml
+
+      - name: Clippy OPC-UA plugin
+        if: runner.os == 'Linux'
+        working-directory: ./lymon-agent
+        run: cargo clippy --release --manifest-path crates/plugin-opcua/Cargo.toml -- -D warnings
+
       - name: Binary size check (Linux)
         if: runner.os == 'Linux'
         working-directory: ./lymon-agent

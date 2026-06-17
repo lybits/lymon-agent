@@ -25,16 +25,16 @@ jobs:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            bin: lymon-agent.exe
-            asset: lymon-agent-windows-x86_64.exe
+            ext: ".exe"
+            slug: windows-x86_64
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            bin: lymon-agent
-            asset: lymon-agent-linux-x86_64
+            ext: ""
+            slug: linux-x86_64
           - os: macos-latest
             target: aarch64-apple-darwin
-            bin: lymon-agent
-            asset: lymon-agent-macos-arm64
+            ext: ""
+            slug: macos-arm64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -60,25 +60,76 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build
+      # Agent + the s7 plugin (a workspace member) build together.
+      - name: Build agent + workspace plugins
         working-directory: ./lymon-agent
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Stage binary
+      # The OPC-UA plugin is kept out of the workspace (own Cargo.lock, heavy
+      # deps), so it needs its own build — but it's first-party and ships in
+      # the bundle below.
+      - name: Build OPC-UA plugin
+        working-directory: ./lymon-agent
+        run: cargo build --release --target ${{ matrix.target }} --manifest-path crates/plugin-opcua/Cargo.toml
+
+      # Assemble a drop-in bundle: the agent binary plus a plugins/ tree in the
+      # exact layout PluginHost::discover expects (<plugins_dir>/<name>/{plugin.json,binary}).
+      # The operator unpacks it under the agent's buffer dir and is done.
+      - name: Stage bundle
         shell: bash
         working-directory: ./lymon-agent
         run: |
+          set -euo pipefail
+          EXT="${{ matrix.ext }}"
+          TARGET="${{ matrix.target }}"
+          REL="target/$TARGET/release"
+          BUNDLE="lymon-agent-${{ matrix.slug }}"
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${{ matrix.bin }}" "dist/${{ matrix.asset }}"
+          # Raw agent binary kept as a standalone asset (back-compat with the
+          # portal's existing "Add agent" install links).
+          cp "$REL/lymon-agent$EXT" "dist/lymon-agent-${{ matrix.slug }}$EXT"
+          # Drop-in bundle layout.
+          for p in lymon-plugin-opcua lymon-plugin-s7; do
+            mkdir -p "dist/$BUNDLE/plugins/$p"
+            cp "$REL/$p$EXT" "dist/$BUNDLE/plugins/$p/"
+          done
+          cp "$REL/lymon-agent$EXT" "dist/$BUNDLE/"
+          cp crates/plugin-opcua/plugin.json "dist/$BUNDLE/plugins/lymon-plugin-opcua/"
+          cp crates/plugin-s7/plugin.json    "dist/$BUNDLE/plugins/lymon-plugin-s7/"
+          # On Windows the manifest exec must carry .exe to launch.
+          if [ -n "$EXT" ]; then
+            sed -i 's#"\./lymon-plugin-opcua"#"./lymon-plugin-opcua.exe"#' "dist/$BUNDLE/plugins/lymon-plugin-opcua/plugin.json"
+            sed -i 's#"\./lymon-plugin-s7"#"./lymon-plugin-s7.exe"#'       "dist/$BUNDLE/plugins/lymon-plugin-s7/plugin.json"
+          fi
 
-      - name: Upload build artifact
+      - name: Archive bundle (tar.gz)
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: ./lymon-agent
+        run: tar -czf "dist/lymon-agent-${{ matrix.slug }}.tar.gz" -C dist "lymon-agent-${{ matrix.slug }}"
+
+      - name: Archive bundle (zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: ./lymon-agent
+        run: Compress-Archive -Path "dist/lymon-agent-${{ matrix.slug }}" -DestinationPath "dist/lymon-agent-${{ matrix.slug }}.zip"
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: lymon-agent/dist/${{ matrix.asset }}
+          name: lymon-agent-${{ matrix.slug }}
+          path: |
+            lymon-agent/dist/lymon-agent-${{ matrix.slug }}${{ matrix.ext }}
+            lymon-agent/dist/lymon-agent-${{ matrix.slug }}.tar.gz
+            lymon-agent/dist/lymon-agent-${{ matrix.slug }}.zip
+          if-no-files-found: ignore
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: lymon-agent/dist/${{ matrix.asset }}
+          files: |
+            lymon-agent/dist/lymon-agent-${{ matrix.slug }}${{ matrix.ext }}
+            lymon-agent/dist/lymon-agent-${{ matrix.slug }}.tar.gz
+            lymon-agent/dist/lymon-agent-${{ matrix.slug }}.zip
+          fail_on_unmatched_files: false
