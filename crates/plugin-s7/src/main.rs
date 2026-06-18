@@ -41,7 +41,10 @@ impl S7Connector {
     /// Get a connected client for (host, rack, slot), (re)connecting on miss / key change.
     fn client_for(&mut self, host: &str, rack: u16, slot: u16) -> Result<&mut S7Client, String> {
         let key = (host.to_string(), rack, slot);
-        let need = self.conn.as_ref().map_or(true, |c| c.key != key);
+        let need = match &self.conn {
+            Some(c) => c.key != key,
+            None => true,
+        };
         if need {
             // Drop any stale/other session before connecting (S7Client::drop disconnects).
             self.conn = None;
