@@ -257,6 +257,22 @@ where
                             Err(e) => warn!(error = %e, "ignoring invalid self-update request"),
                         }
                     }
+                    Some("get_logs") => {
+                        // Cloud asked for the tail of our log ring buffer.
+                        let request_id = v
+                            .get("request_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
+                        let n = v.get("lines").and_then(Value::as_u64).unwrap_or(500) as usize;
+                        let lines = crate::logbuf::tail(n);
+                        let resp = serde_json::json!({
+                            "kind": "logs_response",
+                            "request_id": request_id,
+                            "lines": lines,
+                        });
+                        let _ = tx.send(Message::Text(resp.to_string())).await;
+                    }
                     _ => {}
                 }
             }
