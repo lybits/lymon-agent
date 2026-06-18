@@ -27,6 +27,8 @@ mod logbuf;
 mod modbus;
 mod plugins;
 mod pss;
+#[cfg(windows)]
+mod winservice;
 
 // Generated protobuf types.
 pub mod generated {
@@ -48,12 +50,35 @@ struct Cli {
     /// Optional path to a config file. Env vars take precedence.
     #[arg(long, env = "LYMON_CONFIG")]
     config: Option<String>,
+    /// (Windows) run as a service — the SCM launches the registered binPath
+    /// with this flag. Ignored elsewhere.
+    #[cfg(windows)]
+    #[arg(long, default_value_t = false)]
+    service: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cfg = config::Config::load(cli.config.as_deref())?;
+
+    // Windows service mode: hand control to the SCM dispatcher, which calls
+    // back into run_agent on its own runtime. Everywhere else (and Windows
+    // foreground/dev) we just run the agent directly.
+    #[cfg(windows)]
+    if cli.service {
+        return winservice::run(cli.config);
+    }
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run_agent(cli.config))
+}
+
+/// The agent's actual work. Shared by the foreground path and the Windows
+/// service entrypoint. Runs until the ingest streamer loop ends (≈never under
+/// normal operation).
+async fn run_agent(config_path: Option<String>) -> Result<()> {
+    let cfg = config::Config::load(config_path.as_deref())?;
 
     // Install a process-wide rustls crypto provider (ring) before any TLS. The
     // control channel's wss handshake (tokio-tungstenite) uses the process
