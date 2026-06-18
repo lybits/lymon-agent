@@ -71,6 +71,41 @@ pub struct ReadRequest {
     /// How the result maps to a variable (`{variable_id, unit, …}`).
     #[serde(default)]
     pub naming: Value,
+    /// Batched points to read in ONE op (ADR 41 F2). Each carries its own
+    /// `selection` + `naming`. When empty, the SDK treats the request as a
+    /// single point built from the top-level `selection`/`naming`, so
+    /// single-point callers (and the args-mirror path) keep working. Plugins
+    /// should iterate [`points`](ReadRequest::points) instead of reading
+    /// `selection` directly, and resolve the whole batch in one device call
+    /// (e.g. OPC-UA: one Read over every NodeId).
+    #[serde(default)]
+    pub points: Vec<Point>,
+}
+
+/// One point to read in a batched [`Collector::read`] / [`Collector::subscribe`]
+/// (ADR 41 F2): its own `selection` (what to read) and `naming` (how it maps to
+/// a variable).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Point {
+    #[serde(default)]
+    pub selection: Value,
+    #[serde(default)]
+    pub naming: Value,
+}
+
+impl Point {
+    /// The output variable id from `naming.variable_id`, if present.
+    pub fn variable_id(&self) -> Option<&str> {
+        self.naming.get("variable_id").and_then(Value::as_str)
+    }
+    /// Convenience: a string field from `selection`.
+    pub fn selection_str(&self, key: &str) -> Option<&str> {
+        self.selection.get(key).and_then(Value::as_str)
+    }
+    /// Convenience: a u64 field from `selection`.
+    pub fn selection_u64(&self, key: &str) -> Option<u64> {
+        self.selection.get(key).and_then(Value::as_u64)
+    }
 }
 
 impl ReadRequest {
@@ -85,6 +120,21 @@ impl ReadRequest {
     /// Convenience: a u64 field from `selection`.
     pub fn selection_u64(&self, key: &str) -> Option<u64> {
         self.selection.get(key).and_then(Value::as_u64)
+    }
+
+    /// The points this request reads: the explicit `points` array if non-empty,
+    /// otherwise a single point synthesized from the top-level
+    /// `selection`/`naming`. Plugins iterate this so they transparently support
+    /// both single-point and batched reads.
+    pub fn points(&self) -> Vec<Point> {
+        if self.points.is_empty() {
+            vec![Point {
+                selection: self.selection.clone(),
+                naming: self.naming.clone(),
+            }]
+        } else {
+            self.points.clone()
+        }
     }
 }
 
@@ -289,5 +339,71 @@ fn dispatch<C: Collector>(collector: &mut C, req: &ReadRequest) -> Value {
         },
         // hello / unknown — acknowledge so the agent stays in sync.
         _ => json!({ "ok": true }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req_from(json_str: &str) -> ReadRequest {
+        serde_json::from_str(json_str).expect("parse ReadRequest")
+    }
+
+    #[test]
+    fn single_point_request_synthesizes_one_point() {
+        // No `points` → one point built from the top-level selection/naming.
+        let req = req_from(
+            r#"{"op":"read","selection":{"node_id":"ns=2;s=T"},"naming":{"variable_id":"v1"}}"#,
+        );
+        let pts = req.points();
+        assert_eq!(pts.len(), 1);
+        assert_eq!(pts[0].selection_str("node_id"), Some("ns=2;s=T"));
+        assert_eq!(pts[0].variable_id(), Some("v1"));
+    }
+
+    #[test]
+    fn batched_points_are_returned_verbatim() {
+        let req = req_from(
+            r#"{"op":"read","points":[
+                {"selection":{"node_id":"ns=2;s=A"},"naming":{"variable_id":"a"}},
+                {"selection":{"node_id":"ns=2;s=B"},"naming":{"variable_id":"b"}}
+            ]}"#,
+        );
+        let pts = req.points();
+        assert_eq!(pts.len(), 2);
+        assert_eq!(pts[0].variable_id(), Some("a"));
+        assert_eq!(pts[1].selection_str("node_id"), Some("ns=2;s=B"));
+    }
+
+    #[test]
+    fn explicit_points_take_precedence_over_top_level_selection() {
+        // When both are present, the batch wins (the top-level fields are the
+        // single-point fallback only).
+        let req = req_from(
+            r#"{"op":"read","selection":{"node_id":"ignored"},
+                "points":[{"selection":{"node_id":"used"},"naming":{"variable_id":"v"}}]}"#,
+        );
+        let pts = req.points();
+        assert_eq!(pts.len(), 1);
+        assert_eq!(pts[0].selection_str("node_id"), Some("used"));
+    }
+
+    #[test]
+    fn point_helpers_read_selection_fields() {
+        let req = req_from(r#"{"op":"read","points":[{"selection":{"db":3,"byte":10}}]}"#);
+        let p = &req.points()[0];
+        assert_eq!(p.selection_u64("db"), Some(3));
+        assert_eq!(p.selection_u64("byte"), Some(10));
+        assert_eq!(p.variable_id(), None);
+    }
+
+    #[test]
+    fn empty_request_yields_one_empty_point() {
+        // A bare request still resolves to a single (empty) point so a plugin
+        // can surface a clear "selection required" error rather than panicking.
+        let req = req_from(r#"{"op":"read"}"#);
+        assert_eq!(req.points().len(), 1);
+        assert!(req.points()[0].selection.is_null());
     }
 }

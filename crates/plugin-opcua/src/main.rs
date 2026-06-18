@@ -159,19 +159,29 @@ impl Collector for OpcUaConnector {
             .config_str("endpoint_url")
             .ok_or("config.endpoint_url is required")?
             .to_string();
-        let node_str = req
-            .selection
-            .get("node_id")
-            .and_then(|v| v.as_str())
-            .ok_or("selection.node_id is required (e.g. \"ns=2;s=Temp\")")?;
-        let node_id = NodeId::from_str(node_str)
-            .map_err(|_| format!("invalid node_id {node_str:?} (expected OPC-UA text form)"))?;
-        let var_id = req.variable_id().unwrap_or("opcua.value").to_string();
+
+        // ADR 41 F2 — resolve every demanded point up front; ONE Read service
+        // call covers the whole batch (a single point is just N=1).
+        let points = req.points();
+        let mut to_read: Vec<ReadValueId> = Vec::with_capacity(points.len());
+        let mut targets: Vec<(String, String)> = Vec::with_capacity(points.len()); // (var_id, node_str)
+        for p in &points {
+            let node_str = p
+                .selection_str("node_id")
+                .ok_or("selection.node_id is required (e.g. \"ns=2;s=Temp\")")?;
+            let node_id = NodeId::from_str(node_str)
+                .map_err(|_| format!("invalid node_id {node_str:?} (expected OPC-UA text form)"))?;
+            to_read.push(ReadValueId::from(node_id));
+            targets.push((
+                p.variable_id().unwrap_or("opcua.value").to_string(),
+                node_str.to_string(),
+            ));
+        }
 
         let session = self.session_for(&endpoint, identity_from(req))?;
 
-        // One Read service call: newest value (max_age 0 = read from source).
-        let to_read = vec![ReadValueId::from(node_id)];
+        // One Read service call over every node: newest value (max_age 0 =
+        // read from source).
         let result: Result<Vec<DataValue>, StatusCode> =
             self.rt
                 .block_on(session.read(&to_read, TimestampsToReturn::Neither, 0.0));
@@ -184,18 +194,40 @@ impl Collector for OpcUaConnector {
                 return Err(format!("OPC-UA read failed: {status}"));
             }
         };
-        let dv = values
-            .into_iter()
-            .next()
-            .ok_or("OPC-UA read returned no value")?;
-        let variant = dv
-            .value
-            .ok_or_else(|| format!("node {node_str} has no value (status {:?})", dv.status))?;
-        let value = variant_to_f64(&variant)
-            .ok_or_else(|| format!("node {node_str} value {variant:?} is not numeric"))?;
+        if values.len() < targets.len() {
+            self.conn = None;
+            return Err(format!(
+                "OPC-UA read returned {} of {} values",
+                values.len(),
+                targets.len()
+            ));
+        }
 
-        eprintln!("[opcua] {endpoint} {node_str} → {value}");
-        Ok(vec![Sample::new(var_id, value)])
+        // Map each DataValue back to its point. A node with no numeric value
+        // becomes a bad-quality sample (quality != 0) instead of sinking the
+        // whole batch — per-node OPC-UA status semantics.
+        let mut samples = Vec::with_capacity(targets.len());
+        for ((var_id, node_str), dv) in targets.iter().zip(values) {
+            match dv.value.as_ref().and_then(variant_to_f64) {
+                Some(value) => {
+                    eprintln!("[opcua] {endpoint} {node_str} → {value}");
+                    samples.push(Sample::new(var_id, value));
+                }
+                None => {
+                    eprintln!(
+                        "[opcua] {endpoint} {node_str} → bad (status {:?})",
+                        dv.status
+                    );
+                    samples.push(Sample {
+                        variable_id: var_id.clone(),
+                        value: 0.0,
+                        ts_ms: None,
+                        quality: 1,
+                    });
+                }
+            }
+        }
+        Ok(samples)
     }
 
     /// Browse one level of the address space (source explorer, lazy). Starts at
