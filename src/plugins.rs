@@ -20,7 +20,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
@@ -158,12 +158,13 @@ impl Plugin {
             .current_dir(&self.dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawning plugin {} (subscribe)", self.name))?;
         let mut stdin = child.stdin.take().context("plugin stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("plugin stdout")?).lines();
+        forward_stderr(&self.name, child.stderr.take());
         let req = json!({
             "v": PROTOCOL, "op": "subscribe",
             "connector_id": ing.connector_id, "type": conn.ds_type,
@@ -214,12 +215,13 @@ impl Plugin {
             .current_dir(&self.dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .with_context(|| format!("spawning plugin {}", self.name))?;
         let stdin = child.stdin.take().context("plugin stdin")?;
         let stdout = BufReader::new(child.stdout.take().context("plugin stdout")?).lines();
+        forward_stderr(&self.name, child.stderr.take());
         // No runtime handshake: the manifest declares types + protocol, so the
         // process is a pure request→response loop (one response line per request
         // line). Avoids desync from an unread hello reply.
@@ -365,6 +367,23 @@ impl PluginHost {
     pub fn types(&self) -> Vec<String> {
         self.by_type.keys().cloned().collect()
     }
+}
+
+/// Drain a plugin's piped stderr line-by-line into the agent's tracing output
+/// (so it shows on the agent log AND lands in the log ring buffer for remote
+/// retrieval). MUST run for every piped child — an unread stderr pipe would
+/// fill and block the plugin's writes. Spawned detached; ends when stderr
+/// closes (process exit).
+fn forward_stderr(name: &str, stderr: Option<ChildStderr>) {
+    let Some(stderr) = stderr else { return };
+    let name = name.to_string();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            // target under lymon_agent so the default EnvFilter (info) keeps it.
+            info!(target: "lymon_agent::plugin", plugin = %name, "{line}");
+        }
+    });
 }
 
 fn now_ms() -> i64 {

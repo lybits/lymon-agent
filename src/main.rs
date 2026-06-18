@@ -23,6 +23,7 @@ mod config;
 mod control;
 mod enroll;
 mod ingest_client;
+mod logbuf;
 mod modbus;
 mod plugins;
 mod pss;
@@ -153,7 +154,17 @@ fn init_tracing(otlp_endpoint: Option<&str>) -> Result<()> {
 
     let fmt_layer = tracing_subscriber::fmt::layer().with_target(true).json();
 
-    let registry = tracing_subscriber::registry().with(filter).with(fmt_layer);
+    // Mirror the same formatted lines into the in-memory ring buffer so the
+    // cloud can pull recent logs over the control channel (get_logs).
+    let buf_layer = tracing_subscriber::fmt::layer()
+        .with_target(true)
+        .json()
+        .with_writer(crate::logbuf::MakeBufWriter);
+
+    let registry = tracing_subscriber::registry()
+        .with(filter)
+        .with(fmt_layer)
+        .with(buf_layer);
 
     match otlp_endpoint {
         Some(endpoint) => {
