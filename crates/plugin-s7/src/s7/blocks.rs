@@ -25,9 +25,12 @@ pub struct BlockRef {
 const LIST_DB_TELEGRAM: &[u8] = &[
     0x03, 0x00, 0x00, 0x1f, // TPKT, total length 31
     0x02, 0xf0, 0x80, // COTP DT
-    0x32, 0x07, 0x00, 0x00, 0x05, 0x00, 0x00, 0x08, 0x00, 0x06, // S7 userdata hdr: ParLen 8, DataLen 6
-    0x00, 0x01, 0x12, 0x04, 0x11, 0x43, 0x02, 0x00, // params: Tg=grBlocksInfo(0x43), SubFun=ListBoT(0x02)
-    0xff, 0x09, 0x00, 0x02, 0x30, 0x41, // data: RetVal FF, TSize 09, Len 0002, '0', BlkType DB(0x41)
+    0x32, 0x07, 0x00, 0x00, 0x05, 0x00, 0x00, 0x08, 0x00,
+    0x06, // S7 userdata hdr: ParLen 8, DataLen 6
+    0x00, 0x01, 0x12, 0x04, 0x11, 0x43, 0x02,
+    0x00, // params: Tg=grBlocksInfo(0x43), SubFun=ListBoT(0x02)
+    0xff, 0x09, 0x00, 0x02, 0x30,
+    0x41, // data: RetVal FF, TSize 09, Len 0002, '0', BlkType DB(0x41)
 ];
 
 // Response offsets into the S7 PDU payload returned by `S7Client::exchange`:
@@ -55,7 +58,9 @@ fn parse_block_list(payload: &[u8]) -> Result<Vec<BlockRef>, S7Error> {
     }
     let err_no = u16::from_be_bytes([payload[ERRNO_OFF], payload[ERRNO_OFF + 1]]);
     if err_no != 0 {
-        return Err(S7Error::Other(format!("list-blocks: CPU error 0x{err_no:04x}")));
+        return Err(S7Error::Other(format!(
+            "list-blocks: CPU error 0x{err_no:04x}"
+        )));
     }
     if payload[RETVAL_OFF] != 0xFF {
         return Err(S7Error::Other(format!(

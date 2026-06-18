@@ -6,10 +6,9 @@
 //! - [`blocks`] — the `list blocks of type` telegram that powers discover.
 
 pub mod blocks;
-// rust7 is vendored whole (kept verbatim for a clean upstream diff) but we use only a
-// subset of its API (reads, not writes/extra connect helpers). Silence dead_code/unused
-// and clippy on the vendored module so its third-party style doesn't fail `cargo clippy
-// -D warnings`; client.rs is also excluded from `cargo fmt` via rustfmt.toml.
+// rust7 is vendored whole but we use only a subset of its API (reads, not writes/extra
+// connect helpers). Silence dead_code/unused and clippy on the vendored module so its
+// third-party code doesn't fail `cargo clippy -D warnings`.
 #[allow(dead_code, unused, clippy::all)]
 pub mod client;
 pub mod decode;

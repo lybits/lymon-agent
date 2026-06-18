@@ -61,9 +61,7 @@ impl DType {
             DType::DInt => i32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64,
             DType::UDInt => u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64,
             DType::Real => f32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64,
-            DType::LReal => {
-                f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-            }
+            DType::LReal => f64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]),
         })
     }
 }
@@ -93,8 +91,8 @@ mod tests {
 
     #[test]
     fn decodes_big_endian() {
-        // REAL 3.14 = 0x4048F5C3 big-endian
-        assert!((DType::Real.decode(&[0x40, 0x48, 0xF5, 0xC3]).unwrap() - 3.14).abs() < 1e-5);
+        // REAL 1.5 = 0x3FC00000 big-endian (exact in f32; a non-PI value avoids clippy::approx_constant)
+        assert_eq!(DType::Real.decode(&[0x3F, 0xC0, 0x00, 0x00]).unwrap(), 1.5);
         // INT -1 = 0xFFFF (signed)
         assert_eq!(DType::Int.decode(&[0xFF, 0xFF]).unwrap(), -1.0);
         // UINT 0xFFFF = 65535 (unsigned)
@@ -102,14 +100,19 @@ mod tests {
         // DINT -2 = 0xFFFFFFFE
         assert_eq!(DType::DInt.decode(&[0xFF, 0xFF, 0xFF, 0xFE]).unwrap(), -2.0);
         // UDINT 0x00000100 = 256
-        assert_eq!(DType::UDInt.decode(&[0x00, 0x00, 0x01, 0x00]).unwrap(), 256.0);
+        assert_eq!(
+            DType::UDInt.decode(&[0x00, 0x00, 0x01, 0x00]).unwrap(),
+            256.0
+        );
         // SINT -1 = 0xFF
         assert_eq!(DType::SInt.decode(&[0xFF]).unwrap(), -1.0);
         // USInt 200
         assert_eq!(DType::USInt.decode(&[200]).unwrap(), 200.0);
         // LREAL 1.0 = 0x3FF0000000000000
         assert_eq!(
-            DType::LReal.decode(&[0x3F, 0xF0, 0, 0, 0, 0, 0, 0]).unwrap(),
+            DType::LReal
+                .decode(&[0x3F, 0xF0, 0, 0, 0, 0, 0, 0])
+                .unwrap(),
             1.0
         );
     }

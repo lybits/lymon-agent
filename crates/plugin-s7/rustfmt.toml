@@ -1,4 +1,0 @@
-# The vendored rust7 client keeps its upstream (third-party) formatting verbatim so
-# re-syncing with https://github.com/davenardella/rust7 stays a clean diff. Exclude it
-# from `cargo fmt --check`. All other files in this crate use default rustfmt.
-ignore = ["src/s7/client.rs"]

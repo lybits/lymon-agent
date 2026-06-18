@@ -230,7 +230,10 @@ fn map_s7_err(e: &str, sel: &Selection) -> String {
             sel.db
         )
     } else if el.contains("not found") {
-        format!("s7 read failed: {e} (DB{} does not exist in the CPU)", sel.db)
+        format!(
+            "s7 read failed: {e} (DB{} does not exist in the CPU)",
+            sel.db
+        )
     } else {
         format!("s7 read failed: {e}")
     }
@@ -247,9 +250,18 @@ mod parse_tests {
 
     #[test]
     fn family_resolves_rack_slot() {
-        assert_eq!(resolve_rack_slot(&json!({"family":"s7-1500"})).unwrap(), (0, 1));
-        assert_eq!(resolve_rack_slot(&json!({"family":"s7-300"})).unwrap(), (0, 2));
-        assert_eq!(resolve_rack_slot(&json!({"rack":0,"slot":2})).unwrap(), (0, 2));
+        assert_eq!(
+            resolve_rack_slot(&json!({"family":"s7-1500"})).unwrap(),
+            (0, 1)
+        );
+        assert_eq!(
+            resolve_rack_slot(&json!({"family":"s7-300"})).unwrap(),
+            (0, 2)
+        );
+        assert_eq!(
+            resolve_rack_slot(&json!({"rack":0,"slot":2})).unwrap(),
+            (0, 2)
+        );
         assert_eq!(resolve_rack_slot(&json!({})).unwrap(), (0, 1));
         // a lone explicit slot overrides the family default
         assert_eq!(
@@ -263,7 +275,10 @@ mod parse_tests {
     #[test]
     fn selection_parses_and_validates() {
         let s = parse_selection(&json!({"area":"db","db":1,"byte":4,"type":"int"})).unwrap();
-        assert_eq!((s.area, s.db, s.byte, s.dtype), (S7_AREA_DB, 1, 4, DType::Int));
+        assert_eq!(
+            (s.area, s.db, s.byte, s.dtype),
+            (S7_AREA_DB, 1, 4, DType::Int)
+        );
         // missing db for a DB read
         assert!(parse_selection(&json!({"area":"db","type":"real"})).is_err());
         // bit out of range for bool
