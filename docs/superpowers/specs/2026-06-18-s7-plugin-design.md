@@ -1,8 +1,8 @@
 # S7 connector plugin — design spec
 
 **Date:** 2026-06-18
-**Status:** Approved design, pending spec review
-**Component:** `lymon-agent/crates/plugin-s7`
+**Status:** Approved design + scope, pending spec review
+**Component:** `lymon-agent/crates/plugin-s7` (+ portal exposure in `lymon-platform`)
 **Author:** Lymon team (brainstormed with Claude)
 
 ## 1. Goal & scope
@@ -15,6 +15,8 @@ over ISO-on-TCP (S7comm, TCP/102), with:
   all common numeric types, and bit access.
 - **Discover** — enumerate the CPU's data blocks (numbers + sizes) to power the
   portal source explorer.
+- **Portal exposure** — the connector is selectable and configurable in the Lymon
+  portal (connection by `host` + PLC `family`, or explicit `rack`/`slot`). See §11.
 
 Non-goals: write/actuation, `subscribe`/push (S7comm is poll-only — the agent
 polls via `read`), reading string/char types, and reading *optimized* DBs
@@ -75,14 +77,27 @@ crates/plugin-s7/
 
 ## 5. Connector contract
 
-**config** (per connector):
+**config** (per connector) — the connection is `host` plus the rack/slot, which an
+operator can give either by PLC **family** (the friendly path) or explicitly:
 ```json
-{ "host": "192.168.2.234", "rack": 0, "slot": 1 }
+{ "host": "192.168.2.234", "family": "s7-1500" }   // family resolves rack/slot
+{ "host": "192.168.2.234", "rack": 0, "slot": 1 }  // or set rack/slot explicitly
 ```
-`rack`/`slot` default `0`/`1`; passed to `connect_rack_slot(host, rack, slot)`.
-(For S7-1500 the working slot is 0 or 1 depending on firmware — the classic snap7
-ambiguity; defaulting to 1, overridable, confirmed empirically against the sim and
-documented in the runbook.)
+**Resolution order:** explicit `rack`+`slot` win → else `family` maps to rack/slot
+→ else default rack 0 / slot 1. The plugin always connects via
+`connect_rack_slot(host, rack, slot)` with the *resolved* values, so we own the
+slot number rather than rust7's helper:
+
+| `family` | rack | slot |
+|---|---|---|
+| `s7-1500` | 0 | 1 |
+| `s7-1200` | 0 | 1 |
+| `s7-300`  | 0 | 2 |
+| `s7-400`  | — | explicit (varies by hardware config) |
+
+(The S7-1200/1500 slot is 0 or 1 depending on firmware — confirmed against the sim
+and recorded in the runbook; rust7's own `connect_s71200_1500` uses slot 0. An
+unknown `family` is a clean config error.)
 
 **selection** (per ingest):
 ```json
@@ -125,8 +140,10 @@ struct S7Connector {
 }
 ```
 
-Per `read`: ensure a session (connect if `conn` is `None` or `key` changed),
-compute the byte length from `type`, call `read_area`/`read_bit`, decode → f64 →
+`rack`/`slot` are resolved from `config` (explicit → else `family` → else default
+0/1; see §5) before connecting via `connect_rack_slot`. Per `read`: ensure a
+session (connect if `conn` is `None` or `key` changed), compute the byte length
+from `type`, call `read_area`/`read_bit`, decode → f64 →
 `Sample::new(variable_id, value)`. Connection timeouts are set explicitly
 (rust7 defaults 3000/1000/500 ms) so a poll never hangs silently — the lesson
 banked from the OPC-UA connect-timeout fix (#11). On **any** connect/read error
@@ -218,7 +235,18 @@ covering:
   telegram against a Wireshark S7comm capture.
 - **Slot check:** confirm whether slot 0 or 1 connects to the S7-1500; record it.
 
-## 11. Phasing
+## 11. Portal exposure (lymon-platform)
+
+To use the connector from the UI, the Lymon portal makes `s7` selectable in its
+agent-collector list and configures it through the existing connector-config
+mechanism — a JSON config object (`host` + `family`, or explicit `rack`/`slot`) —
+with a placeholder template guiding the operator to the expected keys. This is a
+small, web-only change in the **private platform repo** (no infra, tenant, or
+schema impact); its implementation detail is tracked there, not in this OSS spec.
+The agent plugin (this spec) is fully buildable and testable without it via the
+JSON-pipe harness (§10).
+
+## 12. Phasing
 
 Both phases land this iteration but are independently testable:
 
@@ -227,16 +255,20 @@ Both phases land this iteration but are independently testable:
   immediately.
 - **Phase 2 — Discover.** `blocks.rs` list-blocks/get-block-info telegrams +
   `discover`. The one novel protocol piece, isolated and Wireshark-validated.
+- **Phase 3 — Portal exposure (lymon-platform).** Make `s7` selectable +
+  configurable in the portal; verify an end-to-end connection from the UI against
+  the sim. Small, web-only; depends on Phase 1.
 
-## 12. Open items / risks
+## 13. Open items / risks
 
 - **Block-list telegram** is the only new protocol surface; de-risked by porting
   from snap7's reference and validating against a live trace.
-- **S7-1500 slot** (0 vs 1) confirmed empirically against the sim.
+- **S7-1200/1500 slot** (0 vs 1) is resolved by `family` and confirmed against the
+  sim (runbook records the working value).
 - **Optimized DBs** are out of reach by design; the runbook makes the TIA settings
   explicit so testing isn't blocked.
 
-## 13. References & attribution
+## 14. References & attribution
 
 - rust7 — https://github.com/davenardella/rust7 (MIT © 2025 Davide Nardella).
   Vendored `client.rs` retains its copyright/license header.
