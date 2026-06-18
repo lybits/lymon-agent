@@ -1,9 +1,10 @@
 [package]
 name = "lymon-plugin-s7"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
+rust-version = "1.85"
 license = "Apache-2.0"
-description = "Example Lymon connector plugin: Siemens S7 (skeleton, built on the SDK)"
+description = "Lymon connector plugin: Siemens S7 (S7-300/400/1200/1500 over ISO-on-TCP), built on the SDK + vendored rust7"
 
 [[bin]]
 name = "lymon-plugin-s7"
