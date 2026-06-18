@@ -72,6 +72,10 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 thiserror = "2"
 
+# Windows service support (the agent runs as a native service on Windows).
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+
 [build-dependencies]
 tonic-build = "0.12"
 
