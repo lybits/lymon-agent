@@ -29,12 +29,7 @@ impl DType {
             "udint" | "dword" => DType::UDInt,
             "real" | "float" => DType::Real,
             "lreal" | "double" => DType::LReal,
-            other => {
-                return Err(format!(
-                    "unknown s7 type {other:?} (expected bool/sint/usint/int/uint/dint/udint/real/lreal, \
-                     or aliases byte/word/dword/float/double)"
-                ))
-            }
+            other => return Err(format!("unknown s7 type: {other:?}")),
         })
     }
 

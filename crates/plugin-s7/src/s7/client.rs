@@ -1003,11 +1003,6 @@ impl S7Client {
         stream.read_exact(&mut payload)?;
         Ok(payload)
     }
-
-    /// Negotiated PDU length (bytes), established at connect-time. 0 until connected.
-    pub(crate) fn pdu_len(&self) -> u16 {
-        self.pdu_length
-    }
 }
 
 impl Drop for S7Client {
