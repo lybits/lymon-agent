@@ -254,9 +254,11 @@ impl Collector for OpcUaConnector {
         })
     }
 
-    /// Stream value changes for `selection.node_id` via an OPC-UA subscription +
-    /// monitored item. The data-change callback (on the event loop) feeds a
-    /// channel; this blocks emitting each change until the process is killed.
+    /// Stream value changes for every demanded point via ONE OPC-UA
+    /// subscription with N monitored items (ADR 41 F2). Each item carries a
+    /// `client_handle` = its index, so the data-change callback maps a change
+    /// back to that point's variable_id. The callback (on the event loop) feeds
+    /// a channel; this blocks emitting each change until the process is killed.
     fn subscribe(
         &mut self,
         req: &ReadRequest,
@@ -266,42 +268,57 @@ impl Collector for OpcUaConnector {
             .config_str("endpoint_url")
             .ok_or("config.endpoint_url is required")?
             .to_string();
-        let node_str = req
-            .selection
-            .get("node_id")
-            .and_then(|v| v.as_str())
-            .ok_or("selection.node_id is required")?;
-        let node =
-            NodeId::from_str(node_str).map_err(|_| format!("invalid node_id {node_str:?}"))?;
-        let var_id = req.variable_id().unwrap_or("opcua.value").to_string();
+
+        // Resolve every point's NodeId; var_ids is indexed by client_handle.
+        let points = req.points();
+        let mut items: Vec<MonitoredItemCreateRequest> = Vec::with_capacity(points.len());
+        let mut var_ids: Vec<String> = Vec::with_capacity(points.len());
+        for (i, p) in points.iter().enumerate() {
+            let node_str = p
+                .selection_str("node_id")
+                .ok_or("selection.node_id is required")?;
+            let node =
+                NodeId::from_str(node_str).map_err(|_| format!("invalid node_id {node_str:?}"))?;
+            let mut item: MonitoredItemCreateRequest = node.into();
+            // client_handle identifies the item in the data-change callback.
+            item.requested_parameters.client_handle = i as u32;
+            items.push(item);
+            var_ids.push(p.variable_id().unwrap_or("opcua.value").to_string());
+        }
         let session = self.session_for(&endpoint, identity_from(req))?;
 
-        // The async data-change callback feeds this channel; the sync loop below
-        // drains it. tokio's sender is Send+Sync (the callback needs that).
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<f64>();
+        // The async data-change callback maps each change to its variable_id
+        // (via the monitored item's client_handle) and feeds this channel; the
+        // sync loop below drains it. tokio's sender is Send+Sync.
+        let var_ids = Arc::new(var_ids);
+        let cb_var_ids = var_ids.clone();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, f64)>();
         self.rt.block_on(async {
-            let cb = DataChangeCallback::new(move |dv: DataValue, _item: &_| {
+            let cb = DataChangeCallback::new(move |dv: DataValue, item: &_| {
                 if let Some(v) = dv.value.as_ref().and_then(variant_to_f64) {
-                    let _ = tx.send(v);
+                    let idx = item.client_handle() as usize;
+                    if idx < cb_var_ids.len() {
+                        let _ = tx.send((idx, v));
+                    }
                 }
             });
             let sub_id = session
                 .create_subscription(Duration::from_millis(1000), 10, 30, 0, 0, true, cb)
                 .await
                 .map_err(|e| format!("create_subscription: {e}"))?;
-            let item: MonitoredItemCreateRequest = node.into();
             session
-                .create_monitored_items(sub_id, TimestampsToReturn::Both, vec![item])
+                .create_monitored_items(sub_id, TimestampsToReturn::Both, items)
                 .await
                 .map_err(|e| format!("create_monitored_items: {e}"))?;
             Ok::<(), String>(())
         })?;
-        eprintln!("[opcua] subscribed {endpoint} {node_str}");
+        eprintln!("[opcua] subscribed {endpoint} ({} points)", var_ids.len());
 
-        // Block emitting each pushed value. recv() ends when the process is
-        // killed (agent reconfigure/shutdown) and the runtime/session tear down.
-        while let Some(v) = rx.blocking_recv() {
-            emit(&[Sample::new(&var_id, v)]);
+        // Block emitting each pushed value, mapping its handle to a variable_id.
+        // recv() ends when the process is killed (agent reconfigure/shutdown)
+        // and the runtime/session tear down.
+        while let Some((idx, v)) = rx.blocking_recv() {
+            emit(&[Sample::new(&var_ids[idx], v)]);
         }
         Ok(())
     }
