@@ -147,6 +147,36 @@ impl Plugin {
         Ok(resp.result)
     }
 
+    /// ADR 41 F3 — batched multi-point live read for the live route. Sends ONE
+    /// `read` with an array of points (`[{selection, naming}]`) and returns the
+    /// `samples` array verbatim (each sample's variable_id ↔ the point, plus
+    /// value/ts_ms/quality) for the cloud's query_response. One round trip
+    /// serves every point of the connector. Same long-lived process +
+    /// respawn-on-error semantics as [`read`](Self::read).
+    pub async fn read_points(
+        &self,
+        ds_type: &str,
+        config: &Value,
+        secrets: &Value,
+        points: &Value,
+    ) -> Result<Value> {
+        let req = json!({
+            "v": PROTOCOL, "op": "read",
+            "type": ds_type, "config": config, "secrets": secrets,
+            "points": points,
+        });
+        let line = self.exchange(&req).await?;
+        let resp: Value = serde_json::from_str(&line).context("plugin response not valid JSON")?;
+        if resp.get("ok").and_then(Value::as_bool) != Some(true) {
+            let err = resp
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("plugin error");
+            return Err(anyhow!(err.to_string()));
+        }
+        Ok(resp.get("samples").cloned().unwrap_or_else(|| json!([])))
+    }
+
     /// Open a subscription (push): spawn a DEDICATED process (not the shared
     /// request/response one), send one `subscribe` request, and return a stream
     /// the caller drains. The process streams `{samples}` lines until killed;
