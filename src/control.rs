@@ -26,7 +26,8 @@ use serde_json::Value;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
-use tracing::{error, info, warn};
+use tracing::{error, info, warn, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::collector::{Collector, Conn, Ingest};
 use crate::enroll::Credentials;
@@ -379,6 +380,21 @@ async fn handle_query(
         op = %op,
         "handling agent query"
     );
+    // ADR 42 P2 — adopt the gateway's W3C traceparent (sent over the control
+    // channel, which isn't HTTP) so the agent's OTLP spans for this work become
+    // children of the originating request's trace — one end-to-end timeline.
+    let span = tracing::info_span!("agent.query", correlation_id = %correlation_id, ds_id = %ds_id, op = %op);
+    if let Some(tp) = req
+        .get("traceparent")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        let mut carrier = std::collections::HashMap::new();
+        carrier.insert("traceparent".to_string(), tp.to_string());
+        span.set_parent(opentelemetry::global::get_text_map_propagator(|p| {
+            p.extract(&carrier)
+        }));
+    }
 
     // Resolve the origin: a legacy provisioned datasource OR a Phase-2 agent-host
     // connector (same id space from the cloud's view). Clone the (type, config,
@@ -408,27 +424,31 @@ async fn handle_query(
     // Dispatch to the local adapter for this origin's type. Built-ins first;
     // any other type falls through to a connector plugin (execd) if one serves
     // it — so Browse/Test work for plugin connectors (e.g. opcua), no recompile.
-    let outcome = if op == "read" {
-        // ADR 41 F3 — the live route: a batched multi-point read. `args.points`
-        // is an array of {selection, naming}; the plugin reads them all in one
-        // round trip and we return {samples} for the cloud to map back.
-        let points = args.get("points").cloned().unwrap_or(Value::Null);
-        match plugins.for_type(&ds_type) {
-            Some(plugin) => plugin
-                .read_points(&ds_type, &config, &secrets, &points)
-                .await
-                .map(|samples| serde_json::json!({ "samples": samples })),
-            None => Err(anyhow::anyhow!("agent has no plugin for {ds_type} read")),
+    let outcome = async {
+        if op == "read" {
+            // ADR 41 F3 — the live route: a batched multi-point read. `args.points`
+            // is an array of {selection, naming}; the plugin reads them all in one
+            // round trip and we return {samples} for the cloud to map back.
+            let points = args.get("points").cloned().unwrap_or(Value::Null);
+            match plugins.for_type(&ds_type) {
+                Some(plugin) => plugin
+                    .read_points(&ds_type, &config, &secrets, &points)
+                    .await
+                    .map(|samples| serde_json::json!({ "samples": samples })),
+                None => Err(anyhow::anyhow!("agent has no plugin for {ds_type} read")),
+            }
+        } else {
+            match ds_type.as_str() {
+                "pss" => crate::pss::run(&op, &args, &config, &secrets, timeout_ms, MAX_ROWS).await,
+                other => match plugins.for_type(other) {
+                    Some(plugin) => plugin.query(&op, other, &config, &secrets, &args).await,
+                    None => Err(anyhow::anyhow!("agent has no adapter for {other}.{op} yet")),
+                },
+            }
         }
-    } else {
-        match ds_type.as_str() {
-            "pss" => crate::pss::run(&op, &args, &config, &secrets, timeout_ms, MAX_ROWS).await,
-            other => match plugins.for_type(other) {
-                Some(plugin) => plugin.query(&op, other, &config, &secrets, &args).await,
-                None => Err(anyhow::anyhow!("agent has no adapter for {other}.{op} yet")),
-            },
-        }
-    };
+    }
+    .instrument(span)
+    .await;
 
     match outcome {
         Ok(result) => {
