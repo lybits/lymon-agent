@@ -212,6 +212,11 @@ fn init_tracing(otlp_endpoint: Option<&str>) -> Result<()> {
 
             let tracer = provider.tracer("lymon-agent");
             opentelemetry::global::set_tracer_provider(provider);
+            // ADR 42 P2 — W3C propagator so we can extract the gateway's
+            // traceparent (sent over the control channel) and parent our spans.
+            opentelemetry::global::set_text_map_propagator(
+                opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+            );
 
             registry.with(OpenTelemetryLayer::new(tracer)).init();
             info!(endpoint, "OpenTelemetry tracing enabled");
