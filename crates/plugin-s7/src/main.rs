@@ -73,21 +73,46 @@ impl Collector for S7Connector {
             .ok_or("config.host is required")?
             .to_string();
         let (rack, slot) = resolve_rack_slot(&req.config)?;
-        let sel = parse_selection(&req.selection)?;
-        let var_id = req.variable_id().unwrap_or("s7.value").to_string();
 
-        let result = {
+        // ADR 41 F2 — read every demanded point of this connector in one op,
+        // over the shared session. S7comm has no multi-var read in this client,
+        // so this is a sequential read per point on the one connection (still
+        // one plugin round-trip instead of N). Parse all selections up front:
+        // a parse error is a config mistake → fail the batch (like a bad node).
+        let points = req.points();
+        let mut targets: Vec<(String, Selection)> = Vec::with_capacity(points.len());
+        for p in &points {
+            let var_id = p.variable_id().unwrap_or("s7.value").to_string();
+            let sel = parse_selection(&p.selection)?;
+            targets.push((var_id, sel));
+        }
+
+        // A wire error on a point → a bad-quality sample (don't sink the rest)
+        // and flag the session for reset so the next poll reconnects.
+        let mut had_wire_err = false;
+        let mut samples = Vec::with_capacity(targets.len());
+        {
             let client = self.client_for(&host, rack, slot)?;
-            read_value(client, &sel)
-        };
-        match result {
-            Ok(v) => Ok(vec![Sample::new(var_id, v)]),
-            Err(e) => {
-                // Any wire error → drop the session so the next poll reconnects.
-                self.reset();
-                Err(map_s7_err(&e, &sel))
+            for (var_id, sel) in &targets {
+                match read_value(client, sel) {
+                    Ok(v) => samples.push(Sample::new(var_id, v)),
+                    Err(e) => {
+                        eprintln!("[s7] {var_id} → bad ({})", map_s7_err(&e, sel));
+                        samples.push(Sample {
+                            variable_id: var_id.clone(),
+                            value: 0.0,
+                            ts_ms: None,
+                            quality: 1,
+                        });
+                        had_wire_err = true;
+                    }
+                }
             }
         }
+        if had_wire_err {
+            self.reset();
+        }
+        Ok(samples)
     }
 
     /// Browse the CPU's data blocks (numbers + sizes) for the portal source explorer.
