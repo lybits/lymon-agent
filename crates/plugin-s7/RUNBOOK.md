@@ -68,7 +68,10 @@ echo '{"v":1,"op":"read","type":"s7","config":{"host":"192.168.2.234","family":"
 ```bash
 echo '{"v":1,"op":"discover","type":"s7","config":{"host":"192.168.2.234","family":"s7-1500"},"args":{}}' \
   | ./target/release/lymon-plugin-s7
-# → {"ok":true,"result":{"kind":"tree","schema_kind":"s7_blocks","nodes":[{"id":"DB1","label":"DB1",...}]}}
+# → {"ok":true,"result":{"kind":"tree","schema_kind":"s7_blocks","nodes":[
+#     {"id":"DB1","label":"DB1 · MotorData (512 B)","node_type":"db",
+#      "meta":{"db":1,"name":"MotorData","size_bytes":512,"lang":4}}, ...]}}
+# (name comes from GetAgBlockInfo's 8-char header field — often blank on optimized S7-1500 DBs)
 ```
 
 **Test a selection** (`op:"test"` returns one scalar, used by the portal "Test selection"):

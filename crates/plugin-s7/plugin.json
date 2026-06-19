@@ -1,6 +1,6 @@
 {
   "name": "lymon-plugin-s7",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "types": ["s7"],
   "exec": "./lymon-plugin-s7",
   "args": [],

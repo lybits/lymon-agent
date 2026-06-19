@@ -115,42 +115,65 @@ impl Collector for S7Connector {
         Ok(samples)
     }
 
-    /// Browse the CPU's data blocks (numbers + sizes) for the portal source explorer.
-    /// Coarse by design — S7comm exposes DB numbers, not field layouts.
+    /// Browse the CPU's data blocks for the portal source explorer, each enriched with
+    /// per-DB metadata (name + size + language). Coarse by design — S7comm exposes DB
+    /// numbers/sizes and the short header name, not the field layout (use OPC-UA for that).
     fn discover(&mut self, req: &ReadRequest) -> Result<Discovery, String> {
         let host = req
             .config_str("host")
             .ok_or("config.host is required")?
             .to_string();
         let (rack, slot) = resolve_rack_slot(&req.config)?;
-        let result = {
+
+        // List the DB numbers (fatal on failure → drop the session), then best-effort
+        // enrich each with GetAgBlockInfo. A per-DB info failure (optimized/legacy block)
+        // is non-fatal — that node just shows the bare "DBn".
+        let built: Result<Vec<Node>, String> = {
             let client = self.client_for(&host, rack, slot)?;
-            s7::blocks::list_data_blocks(client)
-        };
-        let dbs = match result {
-            Ok(d) => d,
-            Err(e) => {
-                self.reset();
-                return Err(format!("s7 discover: {e}"));
+            match s7::blocks::list_data_blocks(client) {
+                Err(e) => Err(format!("s7 discover: {e}")),
+                Ok(dbs) => {
+                    let mut nodes = Vec::with_capacity(dbs.len());
+                    for db in dbs {
+                        let info = s7::blocks::get_block_info(client, db).ok();
+                        nodes.push(db_node(db, info));
+                    }
+                    Ok(nodes)
+                }
             }
         };
-        let nodes = dbs
-            .into_iter()
-            .map(|b| {
-                let label = match b.size {
-                    Some(sz) => format!("DB{} ({} bytes)", b.number, sz),
-                    None => format!("DB{}", b.number),
-                };
-                let mut node = Node::leaf(format!("DB{}", b.number), label, "db");
-                node.meta = serde_json::json!({ "db": b.number, "size_bytes": b.size });
-                node
-            })
-            .collect();
-        Ok(Discovery {
-            schema_kind: "s7_blocks".into(),
-            nodes,
-        })
+        match built {
+            Ok(nodes) => Ok(Discovery {
+                schema_kind: "s7_blocks".into(),
+                nodes,
+            }),
+            Err(e) => {
+                self.reset();
+                Err(e)
+            }
+        }
     }
+}
+
+/// Build a discover node for a DB, enriched with optional [`s7::blocks::BlockInfo`].
+fn db_node(db: u16, info: Option<s7::blocks::BlockInfo>) -> Node {
+    let name = info.as_ref().and_then(|i| i.name.clone());
+    let size = info.as_ref().and_then(|i| i.size);
+    let lang = info.as_ref().and_then(|i| i.lang);
+    let label = match (&name, size) {
+        (Some(n), Some(sz)) => format!("DB{db} · {n} ({sz} B)"),
+        (Some(n), None) => format!("DB{db} · {n}"),
+        (None, Some(sz)) => format!("DB{db} ({sz} B)"),
+        (None, None) => format!("DB{db}"),
+    };
+    let mut node = Node::leaf(format!("DB{db}"), label, "db");
+    node.meta = serde_json::json!({
+        "db": db,
+        "name": name,
+        "size_bytes": size,
+        "lang": lang,
+    });
+    node
 }
 
 /// Read one scalar described by `sel` from a connected client, coerced to f64.
