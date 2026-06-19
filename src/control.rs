@@ -363,6 +363,22 @@ async fn handle_query(
         .get("timeout_ms")
         .and_then(Value::as_u64)
         .unwrap_or(30_000);
+    // ADR 42 P1 — the originating HTTP request's correlation id (distinct from
+    // request_id, which matches THIS query to its response). Logged as a field
+    // so the agent's lines for this work join the cloud request that triggered
+    // it. Empty when the cloud routed outside a request (e.g. a hub tick).
+    let correlation_id = req
+        .get("correlation_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    info!(
+        request_id = %request_id,
+        correlation_id = %correlation_id,
+        ds_id = %ds_id,
+        op = %op,
+        "handling agent query"
+    );
 
     // Resolve the origin: a legacy provisioned datasource OR a Phase-2 agent-host
     // connector (same id space from the cloud's view). Clone the (type, config,
