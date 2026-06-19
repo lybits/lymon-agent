@@ -392,12 +392,26 @@ async fn handle_query(
     // Dispatch to the local adapter for this origin's type. Built-ins first;
     // any other type falls through to a connector plugin (execd) if one serves
     // it — so Browse/Test work for plugin connectors (e.g. opcua), no recompile.
-    let outcome = match ds_type.as_str() {
-        "pss" => crate::pss::run(&op, &args, &config, &secrets, timeout_ms, MAX_ROWS).await,
-        other => match plugins.for_type(other) {
-            Some(plugin) => plugin.query(&op, other, &config, &secrets, &args).await,
-            None => Err(anyhow::anyhow!("agent has no adapter for {other}.{op} yet")),
-        },
+    let outcome = if op == "read" {
+        // ADR 41 F3 — the live route: a batched multi-point read. `args.points`
+        // is an array of {selection, naming}; the plugin reads them all in one
+        // round trip and we return {samples} for the cloud to map back.
+        let points = args.get("points").cloned().unwrap_or(Value::Null);
+        match plugins.for_type(&ds_type) {
+            Some(plugin) => plugin
+                .read_points(&ds_type, &config, &secrets, &points)
+                .await
+                .map(|samples| serde_json::json!({ "samples": samples })),
+            None => Err(anyhow::anyhow!("agent has no plugin for {ds_type} read")),
+        }
+    } else {
+        match ds_type.as_str() {
+            "pss" => crate::pss::run(&op, &args, &config, &secrets, timeout_ms, MAX_ROWS).await,
+            other => match plugins.for_type(other) {
+                Some(plugin) => plugin.query(&op, other, &config, &secrets, &args).await,
+                None => Err(anyhow::anyhow!("agent has no adapter for {other}.{op} yet")),
+            },
+        }
     };
 
     match outcome {
