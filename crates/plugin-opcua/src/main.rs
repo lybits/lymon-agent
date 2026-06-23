@@ -333,28 +333,61 @@ fn browse_node<'a>(
             node_class_mask: 0,
             result_mask: 0x3f,
         }];
-        // max_references_per_node 0 = let the server decide; no View.
-        let results = match session.browse(&to_browse, 0, None).await {
-            Ok(r) => r,
+        // max_references_per_node 0 = let the server decide; no View. Gather the
+        // first page, then follow continuation points: the Siemens S7-1500 (and
+        // other servers) paginate Browse — they return a partial reference set
+        // plus a continuation point. Without browse_next, every child after the
+        // first page is silently dropped (the Object-class DB structs land in a
+        // later page, so they never appear in the source explorer).
+        let mut all_refs = Vec::new();
+        let mut cont = match session.browse(&to_browse, 0, None).await {
+            Ok(results) => match results.into_iter().next() {
+                Some(res) => {
+                    if let Some(refs) = res.references {
+                        all_refs.extend(refs);
+                    }
+                    if res.continuation_point.is_null() { None } else { Some(res.continuation_point) }
+                }
+                None => None,
+            },
             Err(_) => return Vec::new(),
         };
+        // Drain remaining pages — guarded against a misbehaving server and capped
+        // by the node budget so a very wide folder doesn't page unboundedly.
+        let mut pages = 0u32;
+        while let Some(cp) = cont.take() {
+            pages += 1;
+            if pages > 64 || all_refs.len() >= budget.get() {
+                break;
+            }
+            cont = match session.browse_next(false, &[cp]).await {
+                Ok(results) => match results.into_iter().next() {
+                    Some(res) => {
+                        if let Some(refs) = res.references {
+                            all_refs.extend(refs);
+                        }
+                        if res.continuation_point.is_null() { None } else { Some(res.continuation_point) }
+                    }
+                    None => None,
+                },
+                Err(_) => None,
+            };
+        }
+
         let mut nodes = Vec::new();
-        for res in results {
-            let refs = res.references.unwrap_or_default();
-            for r in refs {
-                if budget.get() == 0 {
-                    break;
-                }
-                budget.set(budget.get() - 1);
-                let child_id = r.node_id.node_id.clone();
-                let id_text = child_id.to_string();
-                let label = r.display_name.text.to_string();
-                if r.node_class == NodeClass::Variable {
-                    nodes.push(Node::leaf(id_text, label, "variable"));
-                } else {
-                    let children = browse_node(session, child_id, depth - 1, budget).await;
-                    nodes.push(Node::branch(id_text, label, "folder", children));
-                }
+        for r in all_refs {
+            if budget.get() == 0 {
+                break;
+            }
+            budget.set(budget.get() - 1);
+            let child_id = r.node_id.node_id.clone();
+            let id_text = child_id.to_string();
+            let label = r.display_name.text.to_string();
+            if r.node_class == NodeClass::Variable {
+                nodes.push(Node::leaf(id_text, label, "variable"));
+            } else {
+                let children = browse_node(session, child_id, depth - 1, budget).await;
+                nodes.push(Node::branch(id_text, label, "folder", children));
             }
         }
         nodes
