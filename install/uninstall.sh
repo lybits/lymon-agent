@@ -1,29 +1,44 @@
 #!/usr/bin/env sh
-# Lymon Agent uninstaller (Linux). Reverses install.sh: stops + disables the
-# systemd service, removes the unit, the binary, the env file and the state
-# directory (the local durable buffer). Driven by the one-liner the portal
-# generates:
+# Lymon Agent uninstaller (Linux) — reverses agent.sh: stops and removes the
+# systemd service, the self-update timer/service, the binary, the env file,
+# the plugins tree and the agent state. Driven by the portal one-liner:
 #
-#   curl -fsSL https://get.lymon.io/uninstall.sh | sudo sh
+#   curl -fsSL https://host/install/uninstall.sh | sudo sh
 #
-# Removing the agent here does NOT remove it from the Lymon portal — delete it
-# from the Agents page so it stops showing as enrolled/offline.
+# Pass --keep-data to leave /var/lib/lymon-agent (buffer) in place.
 set -eu
 
-UNIT="lymon-agent"
+KEEP_DATA=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --keep-data) KEEP_DATA=1; shift ;;
+    *) echo "unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
 
-if command -v systemctl >/dev/null 2>&1; then
-  # `|| true` so a half-installed/already-removed agent still cleans up the rest.
-  systemctl disable --now "$UNIT" 2>/dev/null || true
+[ "$(id -u)" = "0" ] || { echo "error: run as root (sudo)" >&2; exit 1; }
+
+# ── Stop + disable units (service + self-update timer) ─────────────────────
+for unit in lymon-agent.service lymon-agent-update.timer lymon-agent-update.service; do
+  systemctl disable --now "$unit" 2>/dev/null || true
+done
+
+# ── Remove unit files ──────────────────────────────────────────────────────
+rm -f /etc/systemd/system/lymon-agent.service \
+      /etc/systemd/system/lymon-agent-update.service \
+      /etc/systemd/system/lymon-agent-update.timer
+systemctl daemon-reload 2>/dev/null || true
+systemctl reset-failed lymon-agent.service 2>/dev/null || true
+
+# ── Remove binary, env, plugins ────────────────────────────────────────────
+rm -f /usr/local/bin/lymon-agent /etc/lymon-agent.env
+rm -rf /usr/local/lib/lymon-agent
+
+# ── Agent state (buffer.db, update trigger) ────────────────────────────────
+if [ "$KEEP_DATA" = "1" ]; then
+  echo "Kept /var/lib/lymon-agent — remove it manually to wipe the buffer."
+else
+  rm -rf /var/lib/lymon-agent
 fi
-rm -f "/etc/systemd/system/${UNIT}.service"
-if command -v systemctl >/dev/null 2>&1; then
-  systemctl daemon-reload 2>/dev/null || true
-fi
 
-rm -f /usr/local/bin/lymon-agent
-rm -f /etc/lymon-agent.env
-rm -rf /var/lib/lymon-agent
-
-echo "✓ lymon-agent uninstalled (service, binary, config and local buffer removed)."
-echo "  Remember to delete the agent from the Lymon portal → Agents."
+echo "✓ lymon-agent uninstalled."
