@@ -58,6 +58,9 @@ pub struct Collector {
     buffer: Arc<BufferDb>,
     /// connector_id → connector. Shared with the control channel (ad-hoc query).
     connectors: Arc<Mutex<HashMap<String, Conn>>>,
+    /// ADR 49 W2.3 — the gateway's Ed25519 public key (raw 32 bytes) for verifying
+    /// signed control writes, set from provision frames. None → signing not required.
+    control_pubkey: Arc<Mutex<Option<Vec<u8>>>>,
     /// ingest_id → running poll task.
     tasks: Mutex<HashMap<String, JoinHandle<()>>>,
     /// Third-party connector plugins (execd), keyed by the types they serve.
@@ -69,9 +72,16 @@ impl Collector {
         Arc::new(Self {
             buffer,
             connectors: Arc::new(Mutex::new(HashMap::new())),
+            control_pubkey: Arc::new(Mutex::new(None)),
             tasks: Mutex::new(HashMap::new()),
             plugins,
         })
+    }
+
+    /// The control-signing public key store, shared with the control channel so
+    /// provision frames update it and write_request handling verifies against it.
+    pub fn control_pubkey(&self) -> Arc<Mutex<Option<Vec<u8>>>> {
+        self.control_pubkey.clone()
     }
 
     /// The connector store, shared with the control channel so a query_request

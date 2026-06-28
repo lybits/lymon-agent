@@ -51,6 +51,9 @@ futures-util = "0.3"
 # rustls 0.23 needs a process-wide crypto provider installed before the first
 # wss handshake; we install `ring` in main(). Pinned to match tokio-tungstenite.
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# ADR 49 W2.3 — control-command signature verification (Ed25519) + key decode.
+ring = "0.17"
+base64 = "0.22"
 
 # Gateway adapters: PSS (Circutor Power Studio) speaks XML over HTTP; dates are
 # DDMMYYYYHHmmss UTC.
