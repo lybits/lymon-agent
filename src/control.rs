@@ -256,8 +256,9 @@ where
                         // read loop and reply with a write_ack (device-confirmed).
                         let tx = tx.clone();
                         let connectors = connectors.clone();
+                        let plugins = plugins.clone();
                         let pubkey = collector.control_pubkey();
-                        tokio::spawn(async move { handle_write(v, connectors, pubkey, tx).await });
+                        tokio::spawn(async move { handle_write(v, connectors, plugins, pubkey, tx).await });
                     }
                     Some("update") => {
                         // Cloud-triggered self-update (phase 2). We DON'T touch
@@ -496,15 +497,7 @@ fn parse_connectors(v: &Value) -> Vec<(String, Conn)> {
                     let writable = c
                         .get("writable_targets")
                         .and_then(Value::as_array)
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|t| {
-                                    let fnc = t.get("fn").and_then(Value::as_str)?;
-                                    let addr = t.get("address").and_then(Value::as_u64)?;
-                                    Some(format!("{fnc}:{addr}"))
-                                })
-                                .collect()
-                        })
+                        .map(|arr| arr.iter().map(target_key).collect())
                         .unwrap_or_default();
                     Some((
                         id,
@@ -568,6 +561,7 @@ async fn respond_err(tx: &mpsc::Sender<Message>, request_id: &str, code: &str, d
 async fn handle_write(
     req: Value,
     connectors: ConnStore,
+    plugins: Arc<crate::plugins::PluginHost>,
     control_pubkey: Arc<Mutex<Option<Vec<u8>>>>,
     tx: mpsc::Sender<Message>,
 ) {
@@ -589,7 +583,7 @@ async fn handle_write(
     let span = tracing::info_span!("agent.write", connector = %connector_id, command_id = %command_id);
     let outcome = async {
         verify_signature(&req, &control_pubkey, &command_id, &connector_id, value, &target).await?;
-        do_write(&connectors, &connector_id, value, &target, want_readback, timeout_ms).await
+        do_write(&connectors, &plugins, &connector_id, value, &target, want_readback, timeout_ms).await
     }
     .instrument(span)
     .await;
@@ -615,32 +609,71 @@ async fn handle_write(
     let _ = tx.send(Message::Text(resp.to_string())).await;
 }
 
+/// The allow-list key for a write target, generalized across protocols: Modbus
+/// "{fn}:{address}", OPC-UA "node:{node_id}", else the canonical JSON. Both the
+/// provisioned list (parse_connectors) and the check use this, so they agree.
+fn target_key(target: &Value) -> String {
+    if let (Some(f), Some(a)) = (
+        target.get("fn").and_then(Value::as_str),
+        target.get("address").and_then(Value::as_u64),
+    ) {
+        format!("{f}:{a}")
+    } else if let Some(n) = target.get("node_id").and_then(Value::as_str) {
+        format!("node:{n}")
+    } else {
+        target.to_string()
+    }
+}
+
 async fn do_write(
     connectors: &ConnStore,
+    plugins: &Arc<crate::plugins::PluginHost>,
     connector_id: &str,
     value: f64,
     target: &Value,
     want_readback: bool,
     timeout_ms: u64,
 ) -> Result<Option<f64>> {
-    // Resolve the connector config + allow-list (clone the fields; never hold the lock across I/O).
+    // Resolve the connector (clone the fields; never hold the lock across I/O).
     let resolved = {
-        connectors
-            .lock()
-            .await
-            .get(connector_id)
-            .map(|c| (c.ds_type.clone(), c.config.clone(), c.writable.clone()))
+        connectors.lock().await.get(connector_id).map(|c| {
+            (c.ds_type.clone(), c.config.clone(), c.secrets.clone(), c.writable.clone())
+        })
     };
-    let Some((ds_type, config, writable)) = resolved else {
+    let Some((ds_type, config, secrets, writable)) = resolved else {
         anyhow::bail!("agent has no connector {connector_id}");
     };
-    if ds_type != "modbus" {
-        anyhow::bail!("connector {connector_id} is not modbus (is {ds_type}); write unsupported");
-    }
     if !value.is_finite() {
         anyhow::bail!("non-finite value");
     }
 
+    // ADR 49 W2.1 — defence in depth: only targets the cloud provisioned as
+    // writable. A compromised gateway can't write arbitrary registers/nodes.
+    let key = target_key(target);
+    if !writable.contains(&key) {
+        anyhow::bail!("target {key} not provisioned writable on {connector_id}");
+    }
+
+    if ds_type == "modbus" {
+        write_modbus(&config, target, value, want_readback, timeout_ms).await
+    } else if let Some(plugin) = plugins.for_type(&ds_type) {
+        // ADR 49 W2.2 — supervisory write via a connector plugin (OPC-UA, …).
+        plugin.write(&ds_type, &config, &secrets, target, value, want_readback).await
+    } else {
+        anyhow::bail!("connector {connector_id} type {ds_type} has no write handler");
+    }
+}
+
+/// ADR 49 W2.1 — the Modbus device write (extracted so do_write can branch by
+/// protocol). Applies the inverse scaling, encodes per datatype, writes, and
+/// optionally reads back.
+async fn write_modbus(
+    config: &Value,
+    target: &Value,
+    value: f64,
+    want_readback: bool,
+    timeout_ms: u64,
+) -> Result<Option<f64>> {
     let host = config
         .get("host")
         .and_then(Value::as_str)
@@ -652,13 +685,6 @@ async fn do_write(
         .get("address")
         .and_then(Value::as_u64)
         .context("target.address missing")? as u16;
-
-    // ADR 49 W2.1 — defence in depth: only write targets the cloud provisioned
-    // as writable. A compromised gateway can't write arbitrary registers.
-    let key = format!("{fnclass}:{address}");
-    if !writable.contains(&key) {
-        anyhow::bail!("target {key} not provisioned writable on {connector_id}");
-    }
     let datatype = target.get("datatype").and_then(Value::as_str).unwrap_or("uint16");
     let word_order = target.get("word_order").and_then(Value::as_str).unwrap_or("big");
     let scale = target.get("scale").and_then(Value::as_f64).unwrap_or(1.0);
@@ -843,6 +869,14 @@ mod write_tests {
         assert!(encode_words("float64", 1.0, "big").is_err());
     }
 
+    #[test]
+    fn target_key_per_protocol() {
+        use super::target_key;
+        assert_eq!(target_key(&serde_json::json!({ "fn": "holding", "address": 40001 })), "holding:40001");
+        assert_eq!(target_key(&serde_json::json!({ "fn": "coil", "address": 5 })), "coil:5");
+        assert_eq!(target_key(&serde_json::json!({ "node_id": "ns=2;s=Sp" })), "node:ns=2;s=Sp");
+    }
+
     // ADR 49 W2.3 — signature verification round-trip + tamper rejection.
     #[tokio::test]
     async fn verifies_and_rejects_signatures() {
@@ -894,8 +928,9 @@ mod write_tests {
             },
         );
         let store = Arc::new(Mutex::new(map));
+        let plugins = crate::plugins::PluginHost::discover("/nonexistent-plugins", &[]);
         let target = serde_json::json!({ "fn": "holding", "address": 40001, "datatype": "uint16" });
-        let r = super::do_write(&store, "conn_1", 42.0, &target, false, 500).await;
+        let r = super::do_write(&store, &plugins, "conn_1", 42.0, &target, false, 500).await;
         assert!(r.is_err());
         assert!(r.unwrap_err().to_string().contains("not provisioned"));
     }

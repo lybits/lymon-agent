@@ -26,9 +26,9 @@ use std::time::Duration;
 use lymon_collector_sdk::{run, Collector, Discovery, Node, ReadRequest, Sample};
 use opcua::client::{Client, ClientBuilder, DataChangeCallback, IdentityToken, Password, Session};
 use opcua::types::{
-    BrowseDescription, BrowseDirection, DataValue, MessageSecurityMode, MonitoredItemCreateRequest,
-    NodeClass, NodeId, ObjectId, ReadValueId, ReferenceTypeId, StatusCode, TimestampsToReturn,
-    UserTokenPolicy, Variant,
+    AttributeId, BrowseDescription, BrowseDirection, DataValue, MessageSecurityMode,
+    MonitoredItemCreateRequest, NodeClass, NodeId, NumericRange, ObjectId, ReadValueId,
+    ReferenceTypeId, StatusCode, TimestampsToReturn, UserTokenPolicy, Variant, WriteValue,
 };
 use tokio::runtime::Runtime;
 
@@ -228,6 +228,81 @@ impl Collector for OpcUaConnector {
             }
         }
         Ok(samples)
+    }
+
+    /// ADR 49 W2.2 — supervisory write to one OPC-UA node. `target.node_id` is
+    /// the node; `write_value` the engineering value (inverse-scaled to the wire
+    /// `datatype`). One Write service call; optional read-back verifies it.
+    /// NOTE: this crate is excluded from the default workspace build (heavy
+    /// async-opcua + RustCrypto) — it is compiled by the plugin pipeline.
+    fn write(&mut self, req: &ReadRequest) -> Result<Option<f64>, String> {
+        let endpoint = req
+            .config_str("endpoint_url")
+            .ok_or("config.endpoint_url is required")?
+            .to_string();
+        let node_str = req
+            .target
+            .get("node_id")
+            .and_then(|v| v.as_str())
+            .ok_or("target.node_id is required (e.g. \"ns=2;s=Setpoint\")")?;
+        let node_id = NodeId::from_str(node_str)
+            .map_err(|_| format!("invalid node_id {node_str:?}"))?;
+        let value = req.write_value.ok_or("write_value is required")?;
+
+        let datatype = req.target.get("datatype").and_then(|v| v.as_str()).unwrap_or("double");
+        let scale = req.target.get("scale").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        let offset = req.target.get("offset").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        // Engineering → raw (inverse of the read path's raw*scale + offset).
+        let raw = (value - offset) / if scale == 0.0 { 1.0 } else { scale };
+
+        let variant = match datatype {
+            "bool" | "boolean" => Variant::Boolean(raw != 0.0),
+            "int16" => Variant::Int16(raw.round() as i16),
+            "uint16" => Variant::UInt16(raw.round() as u16),
+            "int32" => Variant::Int32(raw.round() as i32),
+            "uint32" => Variant::UInt32(raw.round() as u32),
+            "float" | "float32" => Variant::Float(raw as f32),
+            _ => Variant::Double(raw),
+        };
+
+        let session = self.session_for(&endpoint, identity_from(req))?;
+        let write_value = WriteValue {
+            node_id: node_id.clone(),
+            attribute_id: AttributeId::Value as u32,
+            index_range: NumericRange::None,
+            value: DataValue::value_only(variant),
+        };
+        let result: Result<Vec<StatusCode>, StatusCode> =
+            self.rt.block_on(session.write(&[write_value]));
+        match result {
+            Ok(statuses) => {
+                if let Some(s) = statuses.first() {
+                    if !s.is_good() {
+                        self.conn = None;
+                        return Err(format!("OPC-UA write rejected: {s}"));
+                    }
+                }
+            }
+            Err(status) => {
+                self.conn = None;
+                return Err(format!("OPC-UA write failed: {status}"));
+            }
+        }
+
+        if !req.readback {
+            return Ok(None);
+        }
+        // Read the node back and map to an engineering value.
+        let to_read = vec![ReadValueId::from(node_id)];
+        let values: Vec<DataValue> = self
+            .rt
+            .block_on(session.read(&to_read, TimestampsToReturn::Neither, 0.0))
+            .map_err(|s| format!("OPC-UA read-back failed: {s}"))?;
+        let raw_read = values
+            .first()
+            .and_then(|dv| dv.value.as_ref())
+            .and_then(variant_to_f64);
+        Ok(raw_read.map(|r| r * scale + offset))
     }
 
     /// Browse one level of the address space (source explorer, lazy). Starts at

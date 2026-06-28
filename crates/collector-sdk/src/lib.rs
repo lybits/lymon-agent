@@ -80,6 +80,16 @@ pub struct ReadRequest {
     /// (e.g. OPC-UA: one Read over every NodeId).
     #[serde(default)]
     pub points: Vec<Point>,
+    /// ADR 49 W2.2 — supervisory write: the device write target (protocol-
+    /// specific, e.g. OPC-UA `{ "node_id": "ns=2;s=Sp" }`) and the engineering
+    /// value. Set only on the "write" op.
+    #[serde(default)]
+    pub target: Value,
+    #[serde(default)]
+    pub write_value: Option<f64>,
+    /// Verify a write by reading the target back (the "write" op).
+    #[serde(default)]
+    pub readback: bool,
 }
 
 /// One point to read in a batched [`Collector::read`] / [`Collector::subscribe`]
@@ -238,6 +248,13 @@ pub trait Collector {
     }
 
     /// Browse the source into a node tree (source explorer). Opt-in.
+    /// ADR 49 W2.2 — perform a supervisory device write (`req.target` +
+    /// `req.write_value`), returning the read-back engineering value when the
+    /// plugin verifies it. Default: unsupported (read-only plugin).
+    fn write(&mut self, _req: &ReadRequest) -> Result<Option<f64>, String> {
+        Err("write not supported by this connector".into())
+    }
+
     fn discover(&mut self, _req: &ReadRequest) -> Result<Discovery, String> {
         Err("discover not supported by this plugin".into())
     }
@@ -335,6 +352,11 @@ fn dispatch<C: Collector>(collector: &mut C, req: &ReadRequest) -> Value {
         // query / test / history → a single value to validate a selection.
         "query" | "test" | "history" => match collector.query(req) {
             Ok(result) => json!({ "ok": true, "result": result }),
+            Err(e) => json!({ "ok": false, "error": e }),
+        },
+        // ADR 49 W2.2 — supervisory write; returns the read-back value if any.
+        "write" => match collector.write(req) {
+            Ok(readback) => json!({ "ok": true, "readback": readback }),
             Err(e) => json!({ "ok": false, "error": e }),
         },
         // hello / unknown — acknowledge so the agent stays in sync.
