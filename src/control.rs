@@ -195,6 +195,17 @@ where
                     }
                     Some("provision") => {
                         let partial = v.get("partial").and_then(Value::as_bool).unwrap_or(false);
+                        // ADR 49 W2.3 — track the control-signing public key. Every
+                        // provision carries it when signing is enabled; absence means
+                        // disabled, so we mirror the frame's state exactly.
+                        {
+                            use base64::Engine as _;
+                            let pk = v
+                                .get("control_public_key")
+                                .and_then(Value::as_str)
+                                .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok());
+                            *collector.control_pubkey().lock().await = pk;
+                        }
                         // A frame touches a dimension only if its key is present
                         // (collector pushes omit `datasources`, and vice-versa).
                         if let Some(list) = v.get("datasources").and_then(Value::as_array) {
@@ -245,7 +256,8 @@ where
                         // read loop and reply with a write_ack (device-confirmed).
                         let tx = tx.clone();
                         let connectors = connectors.clone();
-                        tokio::spawn(async move { handle_write(v, connectors, tx).await });
+                        let pubkey = collector.control_pubkey();
+                        tokio::spawn(async move { handle_write(v, connectors, pubkey, tx).await });
                     }
                     Some("update") => {
                         // Cloud-triggered self-update (phase 2). We DON'T touch
@@ -553,7 +565,12 @@ async fn respond_err(tx: &mpsc::Sender<Message>, request_id: &str, code: &str, d
 // replies with a device-confirmed write_ack. Supervisory only — never a loop.
 // ---------------------------------------------------------------------------
 
-async fn handle_write(req: Value, connectors: ConnStore, tx: mpsc::Sender<Message>) {
+async fn handle_write(
+    req: Value,
+    connectors: ConnStore,
+    control_pubkey: Arc<Mutex<Option<Vec<u8>>>>,
+    tx: mpsc::Sender<Message>,
+) {
     let command_id = req
         .get("command_id")
         .and_then(Value::as_str)
@@ -570,14 +587,10 @@ async fn handle_write(req: Value, connectors: ConnStore, tx: mpsc::Sender<Messag
     let timeout_ms = req.get("timeout_ms").and_then(Value::as_u64).unwrap_or(5000);
 
     let span = tracing::info_span!("agent.write", connector = %connector_id, command_id = %command_id);
-    let outcome = do_write(
-        &connectors,
-        &connector_id,
-        value,
-        &target,
-        want_readback,
-        timeout_ms,
-    )
+    let outcome = async {
+        verify_signature(&req, &control_pubkey, &command_id, &connector_id, value, &target).await?;
+        do_write(&connectors, &connector_id, value, &target, want_readback, timeout_ms).await
+    }
     .instrument(span)
     .await;
 
@@ -672,6 +685,56 @@ async fn do_write(
             Ok(None)
         }
     }
+}
+
+/// ADR 49 W2.3 — verify the command signature when signing is enabled. No-op
+/// when no public key is provisioned. Verifies the gateway's exact signed bytes
+/// (`sig_payload`) and then checks they describe THIS command, so neither a
+/// forged signature nor a tampered request value is accepted.
+async fn verify_signature(
+    req: &Value,
+    control_pubkey: &Arc<Mutex<Option<Vec<u8>>>>,
+    command_id: &str,
+    connector_id: &str,
+    value: f64,
+    target: &Value,
+) -> Result<()> {
+    let pubkey = control_pubkey.lock().await.clone();
+    let Some(pubkey) = pubkey else {
+        return Ok(()); // signing not required
+    };
+
+    use base64::Engine as _;
+    let sig_b64 = req
+        .get("signature")
+        .and_then(Value::as_str)
+        .context("command signing required but signature missing")?;
+    let payload = req
+        .get("sig_payload")
+        .and_then(Value::as_str)
+        .context("command signing required but sig_payload missing")?;
+    let sig = base64::engine::general_purpose::STANDARD
+        .decode(sig_b64)
+        .context("signature not base64")?;
+
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &pubkey)
+        .verify(payload.as_bytes(), &sig)
+        .map_err(|_| anyhow::anyhow!("invalid command signature"))?;
+
+    // The signed bytes must describe the command we're about to run.
+    let parts: Vec<&str> = payload.split('|').collect();
+    let fnc = target.get("fn").and_then(Value::as_str).unwrap_or("holding");
+    let addr = target.get("address").and_then(Value::as_u64).unwrap_or(0);
+    let signed_value: f64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN);
+    if parts.len() != 4
+        || parts[0] != command_id
+        || parts[1] != connector_id
+        || parts[2] != format!("{fnc}:{addr}")
+        || (signed_value - value).abs() > 1e-9
+    {
+        anyhow::bail!("signed payload does not match the command");
+    }
+    Ok(())
 }
 
 fn split_u32(v: u32, word_order: &str) -> Vec<u16> {
@@ -778,6 +841,38 @@ mod write_tests {
     #[test]
     fn unsupported_datatype_errors() {
         assert!(encode_words("float64", 1.0, "big").is_err());
+    }
+
+    // ADR 49 W2.3 — signature verification round-trip + tamper rejection.
+    #[tokio::test]
+    async fn verifies_and_rejects_signatures() {
+        use base64::Engine as _;
+        use ring::rand::SystemRandom;
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let kp = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let pubkey = kp.public_key().as_ref().to_vec();
+
+        let payload = "cmd_1|conn_1|holding:40001|42.5";
+        let sig = base64::engine::general_purpose::STANDARD.encode(kp.sign(payload.as_bytes()).as_ref());
+        let target = serde_json::json!({ "fn": "holding", "address": 40001, "datatype": "uint16" });
+        let req = serde_json::json!({ "signature": sig, "sig_payload": payload });
+        let store = Arc::new(Mutex::new(Some(pubkey)));
+
+        // Valid signature for the matching command → ok.
+        assert!(super::verify_signature(&req, &store, "cmd_1", "conn_1", 42.5, &target).await.is_ok());
+        // A tampered value (request says 99, signature covers 42.5) → rejected.
+        assert!(super::verify_signature(&req, &store, "cmd_1", "conn_1", 99.0, &target).await.is_err());
+        // Missing signature while a key is set → rejected.
+        let unsigned = serde_json::json!({});
+        assert!(super::verify_signature(&unsigned, &store, "cmd_1", "conn_1", 42.5, &target).await.is_err());
+        // No key provisioned → signing not required, passes.
+        let no_key = Arc::new(Mutex::new(None));
+        assert!(super::verify_signature(&unsigned, &no_key, "cmd_1", "conn_1", 42.5, &target).await.is_ok());
     }
 
     // ADR 49 W2.1 — the allow-list gate rejects a write to a target the cloud
