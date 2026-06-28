@@ -31,11 +31,15 @@ use crate::plugins::PluginHost;
 const MAX_ROWS: usize = 100_000;
 
 /// An agent-host connector: adapter type + non-secret config + resolved secrets.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct Conn {
     pub ds_type: String,
     pub config: Value,
     pub secrets: Value,
+    /// ADR 49 W2.1 — write allow-list: the set of "{fn}:{address}" keys this
+    /// connector may be written to. A write_request to anything else is rejected
+    /// (defence in depth). Empty → connector is read-only.
+    pub writable: std::collections::HashSet<String>,
 }
 
 /// A provisioned ingest (collect job) over a connector.

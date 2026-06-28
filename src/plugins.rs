@@ -449,6 +449,7 @@ mod tests {
             ds_type: "echo".into(),
             config: json!({}),
             secrets: json!({}),
+            ..Default::default()
         };
         let ing = Ingest {
             ingest_id: "ing_1".into(),
