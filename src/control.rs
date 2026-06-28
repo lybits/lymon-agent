@@ -747,15 +747,14 @@ async fn verify_signature(
         .verify(payload.as_bytes(), &sig)
         .map_err(|_| anyhow::anyhow!("invalid command signature"))?;
 
-    // The signed bytes must describe the command we're about to run.
+    // The signed bytes must describe the command we're about to run. The target
+    // key is protocol-generalized (Modbus "{fn}:{addr}" or OPC-UA "node:{id}").
     let parts: Vec<&str> = payload.split('|').collect();
-    let fnc = target.get("fn").and_then(Value::as_str).unwrap_or("holding");
-    let addr = target.get("address").and_then(Value::as_u64).unwrap_or(0);
     let signed_value: f64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN);
     if parts.len() != 4
         || parts[0] != command_id
         || parts[1] != connector_id
-        || parts[2] != format!("{fnc}:{addr}")
+        || parts[2] != target_key(target)
         || (signed_value - value).abs() > 1e-9
     {
         anyhow::bail!("signed payload does not match the command");
