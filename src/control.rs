@@ -480,6 +480,20 @@ fn parse_connectors(v: &Value) -> Vec<(String, Conn)> {
             arr.iter()
                 .filter_map(|c| {
                     let id = c.get("connector_id").and_then(Value::as_str)?.to_string();
+                    // ADR 49 W2.1 — build the write allow-list keys ("{fn}:{address}").
+                    let writable = c
+                        .get("writable_targets")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|t| {
+                                    let fnc = t.get("fn").and_then(Value::as_str)?;
+                                    let addr = t.get("address").and_then(Value::as_u64)?;
+                                    Some(format!("{fnc}:{addr}"))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
                     Some((
                         id,
                         Conn {
@@ -490,6 +504,7 @@ fn parse_connectors(v: &Value) -> Vec<(String, Conn)> {
                                 .to_string(),
                             config: c.get("config").cloned().unwrap_or(Value::Null),
                             secrets: c.get("secrets").cloned().unwrap_or(Value::Null),
+                            writable,
                         },
                     ))
                 })
@@ -595,15 +610,15 @@ async fn do_write(
     want_readback: bool,
     timeout_ms: u64,
 ) -> Result<Option<f64>> {
-    // Resolve the connector config (clone the fields; never hold the lock across I/O).
+    // Resolve the connector config + allow-list (clone the fields; never hold the lock across I/O).
     let resolved = {
         connectors
             .lock()
             .await
             .get(connector_id)
-            .map(|c| (c.ds_type.clone(), c.config.clone()))
+            .map(|c| (c.ds_type.clone(), c.config.clone(), c.writable.clone()))
     };
-    let Some((ds_type, config)) = resolved else {
+    let Some((ds_type, config, writable)) = resolved else {
         anyhow::bail!("agent has no connector {connector_id}");
     };
     if ds_type != "modbus" {
@@ -624,6 +639,13 @@ async fn do_write(
         .get("address")
         .and_then(Value::as_u64)
         .context("target.address missing")? as u16;
+
+    // ADR 49 W2.1 — defence in depth: only write targets the cloud provisioned
+    // as writable. A compromised gateway can't write arbitrary registers.
+    let key = format!("{fnclass}:{address}");
+    if !writable.contains(&key) {
+        anyhow::bail!("target {key} not provisioned writable on {connector_id}");
+    }
     let datatype = target.get("datatype").and_then(Value::as_str).unwrap_or("uint16");
     let word_order = target.get("word_order").and_then(Value::as_str).unwrap_or("big");
     let scale = target.get("scale").and_then(Value::as_f64).unwrap_or(1.0);
@@ -756,5 +778,30 @@ mod write_tests {
     #[test]
     fn unsupported_datatype_errors() {
         assert!(encode_words("float64", 1.0, "big").is_err());
+    }
+
+    // ADR 49 W2.1 — the allow-list gate rejects a write to a target the cloud
+    // never provisioned, BEFORE any device connection (defence in depth).
+    #[tokio::test]
+    async fn rejects_unprovisioned_target() {
+        use crate::collector::Conn;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+        let mut map: HashMap<String, Conn> = HashMap::new();
+        map.insert(
+            "conn_1".to_string(),
+            Conn {
+                ds_type: "modbus".into(),
+                config: serde_json::json!({ "host": "127.0.0.1", "port": 15999 }),
+                writable: std::collections::HashSet::new(), // empty → reject every write
+                ..Default::default()
+            },
+        );
+        let store = Arc::new(Mutex::new(map));
+        let target = serde_json::json!({ "fn": "holding", "address": 40001, "datatype": "uint16" });
+        let r = super::do_write(&store, "conn_1", 42.0, &target, false, 500).await;
+        assert!(r.is_err());
+        assert!(r.unwrap_err().to_string().contains("not provisioned"));
     }
 }
