@@ -147,6 +147,40 @@ impl Plugin {
         Ok(resp.result)
     }
 
+    /// ADR 49 W2.2 — supervisory device write via a connector plugin (OPC-UA,
+    /// …). Sends one `write` op with the protocol-specific `target` + value;
+    /// returns the read-back engineering value when the plugin verifies it.
+    pub async fn write(
+        &self,
+        ds_type: &str,
+        config: &Value,
+        secrets: &Value,
+        target: &Value,
+        value: f64,
+        readback: bool,
+    ) -> Result<Option<f64>> {
+        let req = json!({
+            "v": PROTOCOL, "op": "write",
+            "type": ds_type, "config": config, "secrets": secrets,
+            "target": target, "write_value": value, "readback": readback,
+        });
+        let line = self.exchange(&req).await?;
+        #[derive(serde::Deserialize)]
+        struct WriteResp {
+            ok: bool,
+            #[serde(default)]
+            readback: Option<f64>,
+            #[serde(default)]
+            error: Option<String>,
+        }
+        let resp: WriteResp =
+            serde_json::from_str(&line).context("plugin write response not valid JSON")?;
+        if !resp.ok {
+            return Err(anyhow!(resp.error.unwrap_or_else(|| "plugin write error".into())));
+        }
+        Ok(resp.readback)
+    }
+
     /// ADR 41 F3 — batched multi-point live read for the live route. Sends ONE
     /// `read` with an array of points (`[{selection, naming}]`) and returns the
     /// `samples` array verbatim (each sample's variable_id ↔ the point, plus
