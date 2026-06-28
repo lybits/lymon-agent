@@ -96,4 +96,54 @@ impl ModbusClient {
             }
         }
     }
+
+    /// ADR 49 W2.1 — write holding register(s) starting at `addr`, reconnecting
+    /// on failure. One word → write-single-register (FC 06); many → write-
+    /// multiple-registers (FC 16). Same half-open-PLC timeout protection as read.
+    pub async fn write_holding(&mut self, addr: u16, values: &[u16]) -> Result<()> {
+        if self.ctx.is_none() {
+            self.connect().await?;
+        }
+        let ctx = self.ctx.as_mut().expect("connected");
+        let result = if values.len() == 1 {
+            ctx.write_single_register(addr, values[0]).await
+        } else {
+            ctx.write_multiple_registers(addr, values).await
+        };
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(exc)) => {
+                warn!(exception = ?exc, "Modbus write exception, will reconnect");
+                self.ctx = None;
+                anyhow::bail!("Modbus exception: {exc:?}");
+            }
+            Err(e) => {
+                warn!(error = %e, "Modbus write transport error, will reconnect");
+                self.ctx = None;
+                Err(e.into())
+            }
+        }
+    }
+
+    /// ADR 49 W2.1 — write a single coil (FC 05), reconnecting on failure.
+    pub async fn write_coil(&mut self, addr: u16, on: bool) -> Result<()> {
+        if self.ctx.is_none() {
+            self.connect().await?;
+        }
+        let ctx = self.ctx.as_mut().expect("connected");
+        let result = ctx.write_single_coil(addr, on).await;
+        match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(exc)) => {
+                warn!(exception = ?exc, "Modbus write exception, will reconnect");
+                self.ctx = None;
+                anyhow::bail!("Modbus exception: {exc:?}");
+            }
+            Err(e) => {
+                warn!(error = %e, "Modbus write transport error, will reconnect");
+                self.ctx = None;
+                Err(e.into())
+            }
+        }
+    }
 }

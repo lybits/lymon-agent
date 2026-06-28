@@ -3,8 +3,8 @@
 // The agent dials the cloud gateway's `/agent-control` WebSocket and holds a
 // long-lived stream open (agent-initiated: the agent is behind the customer's
 // NAT, the cloud can't reach in). Over it:
-//   agent → cloud:  hello, heartbeat, query_response
-//   cloud → agent:  hello_ack, provision, query_request
+//   agent → cloud:  hello, heartbeat, query_response, write_ack
+//   cloud → agent:  hello_ack, provision, query_request, write_request
 //
 // On a query_request the cloud asks the agent to run a datasource op against a
 // PRIVATE source on the customer network; the agent executes it locally and
@@ -31,6 +31,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::collector::{Collector, Conn, Ingest};
 use crate::enroll::Credentials;
+use crate::modbus::ModbusClient;
 
 /// Shared connector store (connector_id → connector), owned by the collector
 /// and consulted here so a query_request can target an agent-host connector.
@@ -238,6 +239,13 @@ where
                         tokio::spawn(async move {
                             handle_query(v, store, connectors, plugins, tx).await
                         });
+                    }
+                    Some("write_request") => {
+                        // ADR 49 W2.1 — a supervisory device write. Run it off the
+                        // read loop and reply with a write_ack (device-confirmed).
+                        let tx = tx.clone();
+                        let connectors = connectors.clone();
+                        tokio::spawn(async move { handle_write(v, connectors, tx).await });
                     }
                     Some("update") => {
                         // Cloud-triggered self-update (phase 2). We DON'T touch
@@ -521,4 +529,232 @@ async fn respond_err(tx: &mpsc::Sender<Message>, request_id: &str, code: &str, d
         "error": { "code": code, "detail": detail },
     });
     let _ = tx.send(Message::Text(resp.to_string())).await;
+}
+
+// ---------------------------------------------------------------------------
+// ADR 49 W2.1 — control write-back (Modbus). On a write_request the cloud has
+// already validated/authorized the value (W1 layers); the agent applies the
+// inverse scaling, performs the native write, optionally reads it back, and
+// replies with a device-confirmed write_ack. Supervisory only — never a loop.
+// ---------------------------------------------------------------------------
+
+async fn handle_write(req: Value, connectors: ConnStore, tx: mpsc::Sender<Message>) {
+    let command_id = req
+        .get("command_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let connector_id = req
+        .get("connector_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let value = req.get("value").and_then(Value::as_f64).unwrap_or(f64::NAN);
+    let target = req.get("target").cloned().unwrap_or(Value::Null);
+    let want_readback = req.get("readback").and_then(Value::as_bool).unwrap_or(false);
+    let timeout_ms = req.get("timeout_ms").and_then(Value::as_u64).unwrap_or(5000);
+
+    let span = tracing::info_span!("agent.write", connector = %connector_id, command_id = %command_id);
+    let outcome = do_write(
+        &connectors,
+        &connector_id,
+        value,
+        &target,
+        want_readback,
+        timeout_ms,
+    )
+    .instrument(span)
+    .await;
+
+    let resp = match outcome {
+        Ok(rb) => {
+            let mut j = serde_json::json!({
+                "kind": "write_ack", "command_id": command_id, "status": "acked",
+            });
+            if let Some(v) = rb {
+                j["readback"] = serde_json::json!(v);
+            }
+            info!(command_id = %command_id, "device write acked");
+            j
+        }
+        Err(e) => {
+            warn!(command_id = %command_id, error = %e, "device write failed");
+            serde_json::json!({
+                "kind": "write_ack", "command_id": command_id, "status": "failed", "detail": e.to_string(),
+            })
+        }
+    };
+    let _ = tx.send(Message::Text(resp.to_string())).await;
+}
+
+async fn do_write(
+    connectors: &ConnStore,
+    connector_id: &str,
+    value: f64,
+    target: &Value,
+    want_readback: bool,
+    timeout_ms: u64,
+) -> Result<Option<f64>> {
+    // Resolve the connector config (clone the fields; never hold the lock across I/O).
+    let resolved = {
+        connectors
+            .lock()
+            .await
+            .get(connector_id)
+            .map(|c| (c.ds_type.clone(), c.config.clone()))
+    };
+    let Some((ds_type, config)) = resolved else {
+        anyhow::bail!("agent has no connector {connector_id}");
+    };
+    if ds_type != "modbus" {
+        anyhow::bail!("connector {connector_id} is not modbus (is {ds_type}); write unsupported");
+    }
+    if !value.is_finite() {
+        anyhow::bail!("non-finite value");
+    }
+
+    let host = config
+        .get("host")
+        .and_then(Value::as_str)
+        .context("modbus connector config.host missing")?;
+    let port = config.get("port").and_then(Value::as_u64).unwrap_or(502) as u16;
+
+    let fnclass = target.get("fn").and_then(Value::as_str).unwrap_or("holding");
+    let address = target
+        .get("address")
+        .and_then(Value::as_u64)
+        .context("target.address missing")? as u16;
+    let datatype = target.get("datatype").and_then(Value::as_str).unwrap_or("uint16");
+    let word_order = target.get("word_order").and_then(Value::as_str).unwrap_or("big");
+    let scale = target.get("scale").and_then(Value::as_f64).unwrap_or(1.0);
+    let offset = target.get("offset").and_then(Value::as_f64).unwrap_or(0.0);
+    // Engineering → raw (the inverse of the read path's raw*scale + offset).
+    let raw = (value - offset) / if scale == 0.0 { 1.0 } else { scale };
+
+    let mut client = ModbusClient::new(
+        host.to_string(),
+        port,
+        Duration::from_millis(timeout_ms.max(1000)),
+    );
+
+    if fnclass == "coil" {
+        client.write_coil(address, value != 0.0).await?;
+        Ok(None) // coil read-back omitted in v1
+    } else {
+        let words = encode_words(datatype, raw, word_order)?;
+        client.write_holding(address, &words).await?;
+        if want_readback {
+            let regs = client.read(address, words.len() as u16, false).await?;
+            Ok(Some(decode_words(datatype, &regs, word_order, scale, offset)))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+fn split_u32(v: u32, word_order: &str) -> Vec<u16> {
+    let hi = (v >> 16) as u16;
+    let lo = (v & 0xffff) as u16;
+    if word_order == "little" {
+        vec![lo, hi]
+    } else {
+        vec![hi, lo]
+    }
+}
+
+fn join_u32(regs: &[u16], word_order: &str) -> u32 {
+    let a = regs.first().copied().unwrap_or(0);
+    let b = regs.get(1).copied().unwrap_or(0);
+    let (hi, lo) = if word_order == "little" { (b, a) } else { (a, b) };
+    (u32::from(hi) << 16) | u32::from(lo)
+}
+
+/// Encode an engineering raw value into the register word(s) for a datatype.
+fn encode_words(datatype: &str, raw: f64, word_order: &str) -> Result<Vec<u16>> {
+    let words = match datatype {
+        "bool" => vec![if raw != 0.0 { 1 } else { 0 }],
+        "uint16" => vec![(raw.round() as i64).clamp(0, u16::MAX as i64) as u16],
+        "int16" => vec![((raw.round() as i64).clamp(i16::MIN as i64, i16::MAX as i64) as i16) as u16],
+        "uint32" => split_u32((raw.round() as i64).clamp(0, u32::MAX as i64) as u32, word_order),
+        "int32" => split_u32(((raw.round() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32) as u32, word_order),
+        "float32" => split_u32((raw as f32).to_bits(), word_order),
+        other => anyhow::bail!("unsupported datatype {other}"),
+    };
+    Ok(words)
+}
+
+/// Decode register word(s) back to an engineering value (raw*scale + offset).
+fn decode_words(datatype: &str, regs: &[u16], word_order: &str, scale: f64, offset: f64) -> f64 {
+    let raw = match datatype {
+        "bool" => {
+            if regs.first().copied().unwrap_or(0) != 0 { 1.0 } else { 0.0 }
+        }
+        "uint16" => f64::from(regs.first().copied().unwrap_or(0)),
+        "int16" => f64::from(regs.first().copied().unwrap_or(0) as i16),
+        "uint32" => f64::from(join_u32(regs, word_order)),
+        "int32" => f64::from(join_u32(regs, word_order) as i32),
+        "float32" => f64::from(f32::from_bits(join_u32(regs, word_order))),
+        _ => f64::from(regs.first().copied().unwrap_or(0)),
+    };
+    raw * scale + offset
+}
+
+#[cfg(test)]
+mod write_tests {
+    // ADR 49 W2.1 — encode/decode round-trips for the supervisory write path.
+    use super::{decode_words, encode_words, join_u32, split_u32};
+
+    fn roundtrip(datatype: &str, value: f64, scale: f64, offset: f64, word_order: &str) -> f64 {
+        let raw = (value - offset) / if scale == 0.0 { 1.0 } else { scale };
+        let words = encode_words(datatype, raw, word_order).expect("encode");
+        decode_words(datatype, &words, word_order, scale, offset)
+    }
+
+    #[test]
+    fn uint16_identity() {
+        assert_eq!(roundtrip("uint16", 100.0, 1.0, 0.0, "big"), 100.0);
+    }
+
+    #[test]
+    fn uint16_with_scale_offset() {
+        // engineering 50.0 with scale 0.1 → raw 500 → back to 50.0
+        let v = roundtrip("uint16", 50.0, 0.1, 0.0, "big");
+        assert!((v - 50.0).abs() < 1e-6, "got {v}");
+    }
+
+    #[test]
+    fn int16_negative() {
+        assert_eq!(roundtrip("int16", -5.0, 1.0, 0.0, "big"), -5.0);
+    }
+
+    #[test]
+    fn float32_roundtrip_both_word_orders() {
+        for wo in ["big", "little"] {
+            let v = roundtrip("float32", 3.14, 1.0, 0.0, wo);
+            assert!((v - 3.14).abs() < 1e-4, "wo={wo} got {v}");
+        }
+    }
+
+    #[test]
+    fn uint32_word_order() {
+        // 70000 needs two registers; split/join must invert under both orders.
+        for wo in ["big", "little"] {
+            let words = split_u32(70000, wo);
+            assert_eq!(join_u32(&words, wo), 70000);
+        }
+        // big-endian word order puts the high word first.
+        assert_eq!(split_u32(0x0001_0002, "big"), vec![0x0001, 0x0002]);
+        assert_eq!(split_u32(0x0001_0002, "little"), vec![0x0002, 0x0001]);
+    }
+
+    #[test]
+    fn bool_coil() {
+        assert_eq!(roundtrip("bool", 1.0, 1.0, 0.0, "big"), 1.0);
+        assert_eq!(roundtrip("bool", 0.0, 1.0, 0.0, "big"), 0.0);
+    }
+
+    #[test]
+    fn unsupported_datatype_errors() {
+        assert!(encode_words("float64", 1.0, "big").is_err());
+    }
 }
