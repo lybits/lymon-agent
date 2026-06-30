@@ -49,6 +49,11 @@ struct ProvisionedDs {
 
 type Store = Arc<Mutex<HashMap<String, ProvisionedDs>>>;
 
+/// ADR 50 P2 — open streaming subscriptions, keyed by the cloud's request_id.
+/// Each holds one task per subscribed point (the plugin's `subscribe` op is
+/// single-selection); aborting them drops the PluginStreams (kill_on_drop).
+type Subs = Arc<Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>>;
+
 /// Capacity of the queue in front of the single WS writer task. Small on
 /// purpose: it only needs to absorb short writer hiccups; sustained slowness
 /// must push back on producers, not buffer 100k-row responses in memory.
@@ -154,9 +159,16 @@ async fn serve(
     });
 
     let store: Store = Arc::new(Mutex::new(HashMap::new()));
+    // ADR 50 P2 — live streaming subscriptions opened by the cloud over this stream.
+    let subscriptions: Subs = Arc::new(Mutex::new(HashMap::new()));
 
-    let result = read_loop(&mut read, &tx, &store, collector).await;
+    let result = read_loop(&mut read, &tx, &store, &subscriptions, collector).await;
 
+    // Tear down every streaming subscription when the control stream drops — the
+    // cloud re-subscribes on reconnect. Aborting kills the plugin processes.
+    for (_id, handles) in subscriptions.lock().await.drain() {
+        for h in handles { h.abort(); }
+    }
     heartbeat.abort();
     writer.abort();
     result
@@ -166,6 +178,7 @@ async fn read_loop<S>(
     read: &mut S,
     tx: &mpsc::Sender<Message>,
     store: &Store,
+    subscriptions: &Subs,
     collector: &Arc<Collector>,
 ) -> Result<()>
 where
@@ -259,6 +272,26 @@ where
                         let plugins = plugins.clone();
                         let pubkey = collector.control_pubkey();
                         tokio::spawn(async move { handle_write(v, connectors, plugins, pubkey, tx).await });
+                    }
+                    Some("subscribe_request") => {
+                        // ADR 50 P2 — open a streaming subscription on a connector's
+                        // points (push instead of poll). One plugin stream per point.
+                        let tx = tx.clone();
+                        let connectors = connectors.clone();
+                        let plugins = plugins.clone();
+                        let subscriptions = subscriptions.clone();
+                        tokio::spawn(async move {
+                            handle_subscribe(v, connectors, plugins, tx, subscriptions).await
+                        });
+                    }
+                    Some("unsubscribe_request") => {
+                        // ADR 50 P2 — stop a subscription: abort its tasks (drops the
+                        // plugin streams, killing the processes).
+                        if let Some(request_id) = v.get("request_id").and_then(Value::as_str) {
+                            if let Some(handles) = subscriptions.lock().await.remove(request_id) {
+                                for h in handles { h.abort(); }
+                            }
+                        }
                     }
                     Some("update") => {
                         // Cloud-triggered self-update (phase 2). We DON'T touch
@@ -483,6 +516,112 @@ async fn handle_query(
         }
         Err(e) => respond_err(&tx, &request_id, "agent_query_failed", &e.to_string()).await,
     }
+}
+
+/// ADR 50 P2 — open a streaming subscription for a connector's points. Acks
+/// support, then spawns one task per point that opens a plugin `subscribe`
+/// stream and forwards every pushed batch to the cloud as `point_data`. The
+/// plugin echoes each point's `variable_id`, so the cloud maps samples back.
+async fn handle_subscribe(
+    req: Value,
+    connectors: ConnStore,
+    plugins: Arc<crate::plugins::PluginHost>,
+    tx: mpsc::Sender<Message>,
+    subscriptions: Subs,
+) {
+    let request_id = req.get("request_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let connector_id = req.get("connector_id").and_then(Value::as_str).unwrap_or("").to_string();
+    let ds_type = req.get("ds_type").and_then(Value::as_str).unwrap_or("").to_string();
+    let points = req.get("points").and_then(Value::as_array).cloned().unwrap_or_default();
+
+    // Need the connector config + a plugin that can stream this type. Otherwise
+    // refuse so the cloud falls back to polling.
+    let conn = connectors.lock().await.get(&connector_id).cloned();
+    let supported = conn.is_some() && plugins.for_type(&ds_type).is_some() && !points.is_empty();
+    let _ = tx.send(subscribe_ack(&request_id, supported)).await;
+    let Some(conn) = conn.filter(|_| supported) else { return };
+
+    let mut handles = Vec::with_capacity(points.len());
+    for (i, pt) in points.iter().enumerate() {
+        let selection = pt.get("selection").cloned().unwrap_or(Value::Null);
+        let variable_id = pt
+            .get("naming")
+            .and_then(|n| n.get("variable_id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| i.to_string());
+        let ing = Ingest {
+            ingest_id: format!("sub:{request_id}:{i}"),
+            connector_id: connector_id.clone(),
+            selection,
+            interval_s: 0,
+            naming: serde_json::json!({ "variable_id": variable_id }),
+            transform: Value::Null,
+        };
+        let tx = tx.clone();
+        let plugins = plugins.clone();
+        let conn = conn.clone();
+        let rid = request_id.clone();
+        handles.push(tokio::spawn(async move { stream_point(plugins, conn, ing, rid, tx).await }));
+    }
+    subscriptions.lock().await.insert(request_id, handles);
+}
+
+/// One subscribed point: (re)open the plugin stream and forward each pushed
+/// batch as a `point_data` frame, reopening with a short backoff if it closes.
+/// Exits when the control channel is gone (tx send fails) — which, with
+/// kill_on_drop, kills the plugin process.
+async fn stream_point(
+    plugins: Arc<crate::plugins::PluginHost>,
+    conn: Conn,
+    ing: Ingest,
+    request_id: String,
+    tx: mpsc::Sender<Message>,
+) {
+    let Some(plugin) = plugins.for_type(&conn.ds_type) else { return };
+    loop {
+        match plugin.open_stream(&conn, &ing).await {
+            Ok(mut stream) => loop {
+                match stream.next().await {
+                    Ok(Some(samples)) => {
+                        let arr: Vec<Value> = samples
+                            .iter()
+                            .map(|s| serde_json::json!({
+                                "variable_id": s.point_id,
+                                "value": s.value,
+                                "ts_ms": s.ts_ms,
+                                "quality": s.quality,
+                            }))
+                            .collect();
+                        let frame = serde_json::json!({
+                            "kind": "point_data",
+                            "request_id": request_id,
+                            "samples": arr,
+                        });
+                        if tx.send(Message::Text(frame.to_string())).await.is_err() {
+                            return; // control channel gone → stop (drops the stream)
+                        }
+                    }
+                    Ok(None) => break, // stream closed → reopen
+                    Err(e) => {
+                        warn!(ingest = %ing.ingest_id, error = %e, "subscription stream error; reopening");
+                        break;
+                    }
+                }
+            },
+            Err(e) => warn!(ingest = %ing.ingest_id, error = %e, "opening subscription stream failed; retrying"),
+        }
+        if tx.is_closed() { return; }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// ADR 50 P2 — a subscribe_ack frame (supported true/false).
+fn subscribe_ack(request_id: &str, supported: bool) -> Message {
+    Message::Text(
+        serde_json::json!({ "kind": "subscribe_ack", "request_id": request_id, "supported": supported })
+            .to_string(),
+    )
 }
 
 /// Parse the `connectors` array of a provision frame into (id, Conn) pairs.
