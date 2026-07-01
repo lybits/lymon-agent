@@ -185,7 +185,9 @@ impl Plugin {
         let resp: WriteResp =
             serde_json::from_str(&line).context("plugin write response not valid JSON")?;
         if !resp.ok {
-            return Err(anyhow!(resp.error.unwrap_or_else(|| "plugin write error".into())));
+            return Err(anyhow!(resp
+                .error
+                .unwrap_or_else(|| "plugin write error".into())));
         }
         Ok(resp.readback)
     }
