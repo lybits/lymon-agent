@@ -167,7 +167,9 @@ async fn serve(
     // Tear down every streaming subscription when the control stream drops — the
     // cloud re-subscribes on reconnect. Aborting kills the plugin processes.
     for (_id, handles) in subscriptions.lock().await.drain() {
-        for h in handles { h.abort(); }
+        for h in handles {
+            h.abort();
+        }
     }
     heartbeat.abort();
     writer.abort();
@@ -216,7 +218,9 @@ where
                             let pk = v
                                 .get("control_public_key")
                                 .and_then(Value::as_str)
-                                .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok());
+                                .and_then(|s| {
+                                    base64::engine::general_purpose::STANDARD.decode(s).ok()
+                                });
                             *collector.control_pubkey().lock().await = pk;
                         }
                         // A frame touches a dimension only if its key is present
@@ -271,7 +275,9 @@ where
                         let connectors = connectors.clone();
                         let plugins = plugins.clone();
                         let pubkey = collector.control_pubkey();
-                        tokio::spawn(async move { handle_write(v, connectors, plugins, pubkey, tx).await });
+                        tokio::spawn(async move {
+                            handle_write(v, connectors, plugins, pubkey, tx).await
+                        });
                     }
                     Some("subscribe_request") => {
                         // ADR 50 P2 — open a streaming subscription on a connector's
@@ -289,7 +295,9 @@ where
                         // plugin streams, killing the processes).
                         if let Some(request_id) = v.get("request_id").and_then(Value::as_str) {
                             if let Some(handles) = subscriptions.lock().await.remove(request_id) {
-                                for h in handles { h.abort(); }
+                                for h in handles {
+                                    h.abort();
+                                }
                             }
                         }
                     }
@@ -514,7 +522,12 @@ async fn handle_query(
             });
             let _ = tx.send(Message::Text(resp.to_string())).await;
         }
-        Err(e) => respond_err(&tx, &request_id, "agent_query_failed", &e.to_string()).await,
+        Err(e) => {
+            // Log locally too — the error was only relayed to the cloud, so the
+            // agent's own logs showed the plugin spawn with no visible cause.
+            warn!(ds_id = %ds_id, op = %op, error = %e, "agent query failed");
+            respond_err(&tx, &request_id, "agent_query_failed", &e.to_string()).await;
+        }
     }
 }
 
@@ -529,17 +542,35 @@ async fn handle_subscribe(
     tx: mpsc::Sender<Message>,
     subscriptions: Subs,
 ) {
-    let request_id = req.get("request_id").and_then(Value::as_str).unwrap_or("").to_string();
-    let connector_id = req.get("connector_id").and_then(Value::as_str).unwrap_or("").to_string();
-    let ds_type = req.get("ds_type").and_then(Value::as_str).unwrap_or("").to_string();
-    let points = req.get("points").and_then(Value::as_array).cloned().unwrap_or_default();
+    let request_id = req
+        .get("request_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let connector_id = req
+        .get("connector_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let ds_type = req
+        .get("ds_type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let points = req
+        .get("points")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
 
     // Need the connector config + a plugin that can stream this type. Otherwise
     // refuse so the cloud falls back to polling.
     let conn = connectors.lock().await.get(&connector_id).cloned();
     let supported = conn.is_some() && plugins.for_type(&ds_type).is_some() && !points.is_empty();
     let _ = tx.send(subscribe_ack(&request_id, supported)).await;
-    let Some(conn) = conn.filter(|_| supported) else { return };
+    let Some(conn) = conn.filter(|_| supported) else {
+        return;
+    };
 
     let mut handles = Vec::with_capacity(points.len());
     for (i, pt) in points.iter().enumerate() {
@@ -562,7 +593,9 @@ async fn handle_subscribe(
         let plugins = plugins.clone();
         let conn = conn.clone();
         let rid = request_id.clone();
-        handles.push(tokio::spawn(async move { stream_point(plugins, conn, ing, rid, tx).await }));
+        handles.push(tokio::spawn(async move {
+            stream_point(plugins, conn, ing, rid, tx).await
+        }));
     }
     subscriptions.lock().await.insert(request_id, handles);
 }
@@ -578,7 +611,9 @@ async fn stream_point(
     request_id: String,
     tx: mpsc::Sender<Message>,
 ) {
-    let Some(plugin) = plugins.for_type(&conn.ds_type) else { return };
+    let Some(plugin) = plugins.for_type(&conn.ds_type) else {
+        return;
+    };
     loop {
         match plugin.open_stream(&conn, &ing).await {
             Ok(mut stream) => loop {
@@ -586,12 +621,14 @@ async fn stream_point(
                     Ok(Some(samples)) => {
                         let arr: Vec<Value> = samples
                             .iter()
-                            .map(|s| serde_json::json!({
-                                "variable_id": s.point_id,
-                                "value": s.value,
-                                "ts_ms": s.ts_ms,
-                                "quality": s.quality,
-                            }))
+                            .map(|s| {
+                                serde_json::json!({
+                                    "variable_id": s.point_id,
+                                    "value": s.value,
+                                    "ts_ms": s.ts_ms,
+                                    "quality": s.quality,
+                                })
+                            })
                             .collect();
                         let frame = serde_json::json!({
                             "kind": "point_data",
@@ -609,9 +646,13 @@ async fn stream_point(
                     }
                 }
             },
-            Err(e) => warn!(ingest = %ing.ingest_id, error = %e, "opening subscription stream failed; retrying"),
+            Err(e) => {
+                warn!(ingest = %ing.ingest_id, error = %e, "opening subscription stream failed; retrying")
+            }
         }
-        if tx.is_closed() { return; }
+        if tx.is_closed() {
+            return;
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
@@ -716,13 +757,37 @@ async fn handle_write(
         .to_string();
     let value = req.get("value").and_then(Value::as_f64).unwrap_or(f64::NAN);
     let target = req.get("target").cloned().unwrap_or(Value::Null);
-    let want_readback = req.get("readback").and_then(Value::as_bool).unwrap_or(false);
-    let timeout_ms = req.get("timeout_ms").and_then(Value::as_u64).unwrap_or(5000);
+    let want_readback = req
+        .get("readback")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let timeout_ms = req
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(5000);
 
-    let span = tracing::info_span!("agent.write", connector = %connector_id, command_id = %command_id);
+    let span =
+        tracing::info_span!("agent.write", connector = %connector_id, command_id = %command_id);
     let outcome = async {
-        verify_signature(&req, &control_pubkey, &command_id, &connector_id, value, &target).await?;
-        do_write(&connectors, &plugins, &connector_id, value, &target, want_readback, timeout_ms).await
+        verify_signature(
+            &req,
+            &control_pubkey,
+            &command_id,
+            &connector_id,
+            value,
+            &target,
+        )
+        .await?;
+        do_write(
+            &connectors,
+            &plugins,
+            &connector_id,
+            value,
+            &target,
+            want_readback,
+            timeout_ms,
+        )
+        .await
     }
     .instrument(span)
     .await;
@@ -776,7 +841,12 @@ async fn do_write(
     // Resolve the connector (clone the fields; never hold the lock across I/O).
     let resolved = {
         connectors.lock().await.get(connector_id).map(|c| {
-            (c.ds_type.clone(), c.config.clone(), c.secrets.clone(), c.writable.clone())
+            (
+                c.ds_type.clone(),
+                c.config.clone(),
+                c.secrets.clone(),
+                c.writable.clone(),
+            )
         })
     };
     let Some((ds_type, config, secrets, writable)) = resolved else {
@@ -797,7 +867,9 @@ async fn do_write(
         write_modbus(&config, target, value, want_readback, timeout_ms).await
     } else if let Some(plugin) = plugins.for_type(&ds_type) {
         // ADR 49 W2.2 — supervisory write via a connector plugin (OPC-UA, …).
-        plugin.write(&ds_type, &config, &secrets, target, value, want_readback).await
+        plugin
+            .write(&ds_type, &config, &secrets, target, value, want_readback)
+            .await
     } else {
         anyhow::bail!("connector {connector_id} type {ds_type} has no write handler");
     }
@@ -819,13 +891,22 @@ async fn write_modbus(
         .context("modbus connector config.host missing")?;
     let port = config.get("port").and_then(Value::as_u64).unwrap_or(502) as u16;
 
-    let fnclass = target.get("fn").and_then(Value::as_str).unwrap_or("holding");
+    let fnclass = target
+        .get("fn")
+        .and_then(Value::as_str)
+        .unwrap_or("holding");
     let address = target
         .get("address")
         .and_then(Value::as_u64)
         .context("target.address missing")? as u16;
-    let datatype = target.get("datatype").and_then(Value::as_str).unwrap_or("uint16");
-    let word_order = target.get("word_order").and_then(Value::as_str).unwrap_or("big");
+    let datatype = target
+        .get("datatype")
+        .and_then(Value::as_str)
+        .unwrap_or("uint16");
+    let word_order = target
+        .get("word_order")
+        .and_then(Value::as_str)
+        .unwrap_or("big");
     let scale = target.get("scale").and_then(Value::as_f64).unwrap_or(1.0);
     let offset = target.get("offset").and_then(Value::as_f64).unwrap_or(0.0);
     // Engineering → raw (the inverse of the read path's raw*scale + offset).
@@ -845,7 +926,9 @@ async fn write_modbus(
         client.write_holding(address, &words).await?;
         if want_readback {
             let regs = client.read(address, words.len() as u16, false).await?;
-            Ok(Some(decode_words(datatype, &regs, word_order, scale, offset)))
+            Ok(Some(decode_words(
+                datatype, &regs, word_order, scale, offset,
+            )))
         } else {
             Ok(None)
         }
@@ -889,7 +972,10 @@ async fn verify_signature(
     // The signed bytes must describe the command we're about to run. The target
     // key is protocol-generalized (Modbus "{fn}:{addr}" or OPC-UA "node:{id}").
     let parts: Vec<&str> = payload.split('|').collect();
-    let signed_value: f64 = parts.get(3).and_then(|s| s.parse().ok()).unwrap_or(f64::NAN);
+    let signed_value: f64 = parts
+        .get(3)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(f64::NAN);
     if parts.len() != 4
         || parts[0] != command_id
         || parts[1] != connector_id
@@ -914,7 +1000,11 @@ fn split_u32(v: u32, word_order: &str) -> Vec<u16> {
 fn join_u32(regs: &[u16], word_order: &str) -> u32 {
     let a = regs.first().copied().unwrap_or(0);
     let b = regs.get(1).copied().unwrap_or(0);
-    let (hi, lo) = if word_order == "little" { (b, a) } else { (a, b) };
+    let (hi, lo) = if word_order == "little" {
+        (b, a)
+    } else {
+        (a, b)
+    };
     (u32::from(hi) << 16) | u32::from(lo)
 }
 
@@ -923,9 +1013,17 @@ fn encode_words(datatype: &str, raw: f64, word_order: &str) -> Result<Vec<u16>> 
     let words = match datatype {
         "bool" => vec![if raw != 0.0 { 1 } else { 0 }],
         "uint16" => vec![(raw.round() as i64).clamp(0, u16::MAX as i64) as u16],
-        "int16" => vec![((raw.round() as i64).clamp(i16::MIN as i64, i16::MAX as i64) as i16) as u16],
-        "uint32" => split_u32((raw.round() as i64).clamp(0, u32::MAX as i64) as u32, word_order),
-        "int32" => split_u32(((raw.round() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32) as u32, word_order),
+        "int16" => {
+            vec![((raw.round() as i64).clamp(i16::MIN as i64, i16::MAX as i64) as i16) as u16]
+        }
+        "uint32" => split_u32(
+            (raw.round() as i64).clamp(0, u32::MAX as i64) as u32,
+            word_order,
+        ),
+        "int32" => split_u32(
+            ((raw.round() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32) as u32,
+            word_order,
+        ),
         "float32" => split_u32((raw as f32).to_bits(), word_order),
         other => anyhow::bail!("unsupported datatype {other}"),
     };
@@ -936,7 +1034,11 @@ fn encode_words(datatype: &str, raw: f64, word_order: &str) -> Result<Vec<u16>> 
 fn decode_words(datatype: &str, regs: &[u16], word_order: &str, scale: f64, offset: f64) -> f64 {
     let raw = match datatype {
         "bool" => {
-            if regs.first().copied().unwrap_or(0) != 0 { 1.0 } else { 0.0 }
+            if regs.first().copied().unwrap_or(0) != 0 {
+                1.0
+            } else {
+                0.0
+            }
         }
         "uint16" => f64::from(regs.first().copied().unwrap_or(0)),
         "int16" => f64::from(regs.first().copied().unwrap_or(0) as i16),
@@ -979,8 +1081,8 @@ mod write_tests {
     #[test]
     fn float32_roundtrip_both_word_orders() {
         for wo in ["big", "little"] {
-            let v = roundtrip("float32", 3.14, 1.0, 0.0, wo);
-            assert!((v - 3.14).abs() < 1e-4, "wo={wo} got {v}");
+            let v = roundtrip("float32", 3.25, 1.0, 0.0, wo);
+            assert!((v - 3.25).abs() < 1e-4, "wo={wo} got {v}");
         }
     }
 
@@ -1010,9 +1112,18 @@ mod write_tests {
     #[test]
     fn target_key_per_protocol() {
         use super::target_key;
-        assert_eq!(target_key(&serde_json::json!({ "fn": "holding", "address": 40001 })), "holding:40001");
-        assert_eq!(target_key(&serde_json::json!({ "fn": "coil", "address": 5 })), "coil:5");
-        assert_eq!(target_key(&serde_json::json!({ "node_id": "ns=2;s=Sp" })), "node:ns=2;s=Sp");
+        assert_eq!(
+            target_key(&serde_json::json!({ "fn": "holding", "address": 40001 })),
+            "holding:40001"
+        );
+        assert_eq!(
+            target_key(&serde_json::json!({ "fn": "coil", "address": 5 })),
+            "coil:5"
+        );
+        assert_eq!(
+            target_key(&serde_json::json!({ "node_id": "ns=2;s=Sp" })),
+            "node:ns=2;s=Sp"
+        );
     }
 
     // ADR 49 W2.3 — signature verification round-trip + tamper rejection.
@@ -1030,21 +1141,38 @@ mod write_tests {
         let pubkey = kp.public_key().as_ref().to_vec();
 
         let payload = "cmd_1|conn_1|holding:40001|42.5";
-        let sig = base64::engine::general_purpose::STANDARD.encode(kp.sign(payload.as_bytes()).as_ref());
+        let sig =
+            base64::engine::general_purpose::STANDARD.encode(kp.sign(payload.as_bytes()).as_ref());
         let target = serde_json::json!({ "fn": "holding", "address": 40001, "datatype": "uint16" });
         let req = serde_json::json!({ "signature": sig, "sig_payload": payload });
         let store = Arc::new(Mutex::new(Some(pubkey)));
 
         // Valid signature for the matching command → ok.
-        assert!(super::verify_signature(&req, &store, "cmd_1", "conn_1", 42.5, &target).await.is_ok());
+        assert!(
+            super::verify_signature(&req, &store, "cmd_1", "conn_1", 42.5, &target)
+                .await
+                .is_ok()
+        );
         // A tampered value (request says 99, signature covers 42.5) → rejected.
-        assert!(super::verify_signature(&req, &store, "cmd_1", "conn_1", 99.0, &target).await.is_err());
+        assert!(
+            super::verify_signature(&req, &store, "cmd_1", "conn_1", 99.0, &target)
+                .await
+                .is_err()
+        );
         // Missing signature while a key is set → rejected.
         let unsigned = serde_json::json!({});
-        assert!(super::verify_signature(&unsigned, &store, "cmd_1", "conn_1", 42.5, &target).await.is_err());
+        assert!(
+            super::verify_signature(&unsigned, &store, "cmd_1", "conn_1", 42.5, &target)
+                .await
+                .is_err()
+        );
         // No key provisioned → signing not required, passes.
         let no_key = Arc::new(Mutex::new(None));
-        assert!(super::verify_signature(&unsigned, &no_key, "cmd_1", "conn_1", 42.5, &target).await.is_ok());
+        assert!(
+            super::verify_signature(&unsigned, &no_key, "cmd_1", "conn_1", 42.5, &target)
+                .await
+                .is_ok()
+        );
     }
 
     // ADR 49 W2.1 — the allow-list gate rejects a write to a target the cloud
