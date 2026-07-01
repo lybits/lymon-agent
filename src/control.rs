@@ -514,7 +514,12 @@ async fn handle_query(
             });
             let _ = tx.send(Message::Text(resp.to_string())).await;
         }
-        Err(e) => respond_err(&tx, &request_id, "agent_query_failed", &e.to_string()).await,
+        Err(e) => {
+            // Log locally too — the error was only relayed to the cloud, so the
+            // agent's own logs showed the plugin spawn with no visible cause.
+            warn!(ds_id = %ds_id, op = %op, error = %e, "agent query failed");
+            respond_err(&tx, &request_id, "agent_query_failed", &e.to_string()).await;
+        }
     }
 }
 

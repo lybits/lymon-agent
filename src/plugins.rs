@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
@@ -22,7 +22,16 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
+use tokio::time::timeout;
 use tracing::{info, warn};
+
+/// Host-level backstop: max time to wait for a plugin to answer one request.
+/// A plugin that reads the request but never replies (a crash that leaves stdout
+/// open, a deadlock) would otherwise hold this connector's shared process lock
+/// forever, blocking every later collect/query. Set WELL ABOVE any plugin's own
+/// internal timeouts (e.g. the OPC-UA connect budget) so it only fires for a
+/// genuinely stuck process — then we kill it and the next call respawns.
+const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 use crate::collector::{Conn, Ingest};
 use crate::generated::lymon::ingest::v1::Sample;
@@ -257,14 +266,21 @@ impl Plugin {
         let io: Result<String> = async {
             proc.stdin.write_all(payload.as_bytes()).await?;
             proc.stdin.flush().await?;
-            match proc.stdout.next_line().await? {
-                Some(l) => Ok(l),
-                None => Err(anyhow!("plugin closed its output")),
+            match timeout(EXCHANGE_TIMEOUT, proc.stdout.next_line()).await {
+                Ok(read) => match read? {
+                    Some(l) => Ok(l),
+                    None => Err(anyhow!("plugin closed its output")),
+                },
+                Err(_) => Err(anyhow!(
+                    "plugin did not respond within {}s",
+                    EXCHANGE_TIMEOUT.as_secs()
+                )),
             }
         }
         .await;
-        if io.is_err() {
-            // Drop the broken process so the next call respawns it.
+        if let Err(e) = &io {
+            // Surface why, then drop the broken process so the next call respawns.
+            warn!(plugin = %self.name, error = %e, "plugin exchange failed; respawning");
             if let Some(mut p) = guard.take() {
                 let _ = p.child.start_kill();
             }
